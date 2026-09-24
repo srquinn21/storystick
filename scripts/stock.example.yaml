@@ -1,0 +1,38 @@
+# Stock catalog: what sheet goods you CAN buy, not what you have on hand.
+# This is meant to be stable across projects -- edit it when you switch
+# material, not per run. `storystick cutlist` reports how many of each
+# sheet a project needs to buy; if you already have some on hand, note
+# that on the BOM by hand afterward.
+#
+# Two sections:
+#   materials -- a name -> thickness catalog. Two materials can share a
+#     thickness (e.g. two different 3/4" plies below) while being
+#     genuinely different stock -- that's the whole point of naming them
+#     separately instead of just keying everything off thickness_in.
+#   sheets -- purchasable sizes, each naming which material they're a
+#     sheet of. A sheet's thickness always comes from its material, never
+#     repeated here, so two sizes of the same material can't drift.
+#
+# To route a specific part to a specific material (e.g. keep a hidden
+# stretcher off the good plywood), set that row's `material` column in
+# parts.csv to the material's name below. Left blank, a part matches any
+# material at its own measured thickness -- the common case.
+
+materials:
+  - name: "Baltic Birch 3/4 (finished 2 sides)"
+    thickness_in: 0.75
+  - name: "Sande Ply 3/4 (utility, unseen parts)"
+    thickness_in: 0.75
+  - name: "Baltic Birch 1/4"
+    thickness_in: 0.25
+
+sheets:
+  - material: "Baltic Birch 3/4 (finished 2 sides)"
+    length_in: 96
+    width_in: 48
+  - material: "Sande Ply 3/4 (utility, unseen parts)"
+    length_in: 96
+    width_in: 48
+  - material: "Baltic Birch 1/4"
+    length_in: 96
+    width_in: 48
