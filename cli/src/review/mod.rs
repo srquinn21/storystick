@@ -118,7 +118,14 @@ pub(crate) struct Part {
     /// a real mismatch (wrong material picked, or this part isn't what it
     /// looks like), not just a missed correction. See `resolve_dims`.
     pub thickness_mismatch: bool,
-    pub material: Option<String>,
+    /// This part's resolved material, if any -- always a clone of one of
+    /// `App::materials`' entries (or `load_parts`' local `materials`
+    /// slice), never a free-standing name: once a name comes off
+    /// `Project::autofill`/`assignments` or a picker choice, it's
+    /// resolved to a real `Material` immediately (see `find_material`)
+    /// rather than carried as a string that might not resolve to
+    /// anything, the way it used to be.
+    pub material: Option<Material>,
     /// Whether `material` is this part's own exception (see
     /// `crate::project::Project::assignments`) rather than derived fresh
     /// from a bracket-tag rule (`crate::project::Project::autofill`) or
@@ -182,13 +189,24 @@ fn format_editable(v: f64) -> String {
 impl Part {
     fn to_packable(&self) -> PackablePart {
         let mut part = PackablePart::new(self.path.clone(), self.length_in * MM_PER_IN, self.width_in * MM_PER_IN, self.thickness_in * MM_PER_IN);
-        part.material_name = self.material.clone();
+        part.material_name = self.material.as_ref().map(|m| m.name.clone());
         part
     }
 }
 
 fn compatible_materials<'a>(materials: &'a [Material], thickness_in: f64) -> Vec<&'a Material> {
     materials.iter().filter(|m| (m.thickness_mm / MM_PER_IN - thickness_in).abs() <= COMPATIBLE_THICKNESS_TOLERANCE_IN).collect()
+}
+
+/// Looks up a material by name against `materials` -- this project's own
+/// resolved subset. Panics if it isn't there: every name reaching this
+/// (an `autofill` value, an `assignments` exception, or a picker
+/// selection built straight from `materials` itself) has already passed
+/// `Project::validate_references` or was never anything but one of
+/// `materials`' own names, so a miss here would mean that check was
+/// skipped, not a normal, recoverable user error.
+fn find_material<'a>(materials: &'a [Material], name: &str) -> &'a Material {
+    materials.iter().find(|m| m.name == name).unwrap_or_else(|| panic!("material {name:?} not found -- was Project::validate_references skipped?"))
 }
 
 /// Every distinct bracket tag across `parts`' paths, with how many parts
@@ -212,28 +230,6 @@ fn distinct_tags(parts: &[Part]) -> Vec<(String, usize)> {
         }
     }
     order.into_iter().map(|tag| { let count = counts[&tag]; (tag, count) }).collect()
-}
-
-/// The current material distribution among every part carrying `tag`,
-/// most-common first -- the "current material spread" a bulk-edit
-/// confirmation summary shows before a mass write, so it's never a blind
-/// overwrite of parts that might already disagree with each other (some
-/// resolved from the existing rule, some from their own exception).
-fn material_spread(parts: &[Part], tag: &str) -> Vec<(Option<String>, usize)> {
-    let mut order: Vec<Option<String>> = Vec::new();
-    let mut counts: HashMap<Option<String>, usize> = HashMap::new();
-    for part in parts {
-        if tags::extract_tags(&part.path).iter().any(|t| t == tag) {
-            let key = part.material.clone();
-            if !counts.contains_key(&key) {
-                order.push(key.clone());
-            }
-            *counts.entry(key).or_insert(0) += 1;
-        }
-    }
-    let mut spread: Vec<(Option<String>, usize)> = order.into_iter().map(|key| { let count = counts[&key]; (key, count) }).collect();
-    spread.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-    spread
 }
 
 /// A part's material, given whether it has its own `exception` (from
@@ -265,13 +261,13 @@ fn resolve_material(path: &str, exception: Option<String>, autofill_map: &std::c
 /// whatever a rule says, including a rule that changes after the
 /// exception was set. Returns the indices actually changed so the caller
 /// can re-derive each one's dims (`App::resolve_part_dims`).
-fn apply_bulk_material(parts: &mut [Part], autofill_map: &std::collections::BTreeMap<String, String>) -> Vec<usize> {
+fn apply_bulk_material(parts: &mut [Part], autofill_map: &std::collections::BTreeMap<String, String>, materials: &[Material]) -> Vec<usize> {
     let mut changed = Vec::new();
     for (i, part) in parts.iter_mut().enumerate() {
         if part.is_exception {
             continue;
         }
-        let resolved = autofill::guess_material(&part.path, autofill_map);
+        let resolved = autofill::guess_material(&part.path, autofill_map).map(|name| find_material(materials, &name).clone());
         if part.material != resolved {
             part.material = resolved;
             changed.push(i);
@@ -322,11 +318,11 @@ fn load_parts(step_path: &Path, project: &Project, materials: &[Material]) -> Re
             let key = assignment_key(&instance.path, raw_length_in, raw_width_in, raw_thickness_in);
             let over = project.assignments.get(&key);
             let exception = over.and_then(|o| o.material.clone());
-            let (material, is_exception) = resolve_material(&instance.path, exception, &project.autofill);
+            let (material_name, is_exception) = resolve_material(&instance.path, exception, &project.autofill);
             let swapped = over.map(|o| o.swapped).unwrap_or(false);
-            let material_ref = material.as_deref().and_then(|name| materials.iter().find(|m| m.name == name));
+            let material = material_name.map(|name| find_material(materials, &name).clone());
             let (length_in, width_in, thickness_in, thickness_mismatch) =
-                resolve_dims((raw_length_in, raw_width_in, raw_thickness_in), material_ref, swapped);
+                resolve_dims((raw_length_in, raw_width_in, raw_thickness_in), material.as_ref(), swapped);
             parts.push(Part {
                 path: instance.path.clone(),
                 assignment_key: key,
@@ -363,15 +359,16 @@ pub(crate) struct PickerState {
     pub(crate) list_state: ListState,
 }
 
-/// Bulk-edit-by-tag's own two stages, ahead of the shared material
-/// picker: pick which tag to act on, then see a summary (how many parts,
-/// what they're currently set to) before that mass write is even offered
-/// a material to apply. Choosing a material happens via `App::picker`
-/// (`PickerTarget::Tag`), not a third variant here -- and it's *that*
-/// step that actually writes the project's `autofill` rule.
+/// Bulk-edit-by-tag's own screen: the list of every bracket tag in the
+/// tree, each with its part count and (if a rule is already set) the
+/// material it currently resolves to. Enter on a row hands off straight
+/// to the shared material picker (`App::picker`, `PickerTarget::Tag`) --
+/// which is what actually writes the project's `autofill` rule -- and
+/// this state is left in place underneath it, so cancelling or
+/// confirming that picker lands back on this same tag list with its
+/// material column refreshed (see `confirm_picker`).
 pub(crate) enum BulkState {
-    PickTag { tags: Vec<(String, usize)>, list_state: ListState },
-    ConfirmTag { tag: String, count: usize, spread: Vec<(Option<String>, usize)> },
+    PickTag { tags: Vec<(String, usize, Option<String>)>, list_state: ListState },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -463,8 +460,16 @@ impl App {
         self.status == self.default_status
     }
 
-    pub(crate) fn assigned_counts(&self) -> (usize, usize) {
-        (self.parts.iter().filter(|p| p.material.is_some()).count(), self.parts.len())
+    /// (resolved, total) for the top-right title -- "resolved" means a
+    /// material assigned *and* no `part_flag` reason left standing, not
+    /// merely `material.is_some()`. A thickness-mismatched part still
+    /// carries a material name, but that's a wrong decision, not a made
+    /// one: counting it here would let the corner hit N/N green while a
+    /// red-flagged row remains in the tree, which is the one thing this
+    /// count exists to rule out.
+    pub(crate) fn resolved_counts(&self) -> (usize, usize) {
+        let resolved = self.parts.iter().filter(|p| p.material.is_some() && part_flag(p, &self.materials).is_none()).count();
+        (resolved, self.parts.len())
     }
 
     fn selected_part_index(&self) -> Option<usize> {
@@ -500,47 +505,47 @@ impl App {
         options.insert(0, "(clear -- match by thickness alone)".to_string());
         let current_index = match &part.material {
             None => 0,
-            Some(name) => options.iter().position(|o| o == name).unwrap_or(0),
+            Some(m) => options.iter().position(|o| o == &m.name).unwrap_or(0),
         };
         let mut list_state = ListState::default();
         list_state.select(Some(current_index));
         self.picker = Some(PickerState { target: PickerTarget::Part(i), options, list_state });
     }
 
-    /// Opens bulk-edit's tag list (stage 1 of 3 -- see `BulkState`), or
-    /// reports there's nothing to bulk-edit if no part in the whole tree
-    /// carries a bracket tag at all.
+    /// Opens bulk-edit's tag list (see `BulkState`), or reports there's
+    /// nothing to bulk-edit if no part in the whole tree carries a
+    /// bracket tag at all. Each row's material column comes straight from
+    /// the project's current `autofill` rule for that tag, if any.
     fn open_bulk_edit(&mut self) {
         let tags = distinct_tags(&self.parts);
         if tags.is_empty() {
             self.set_status("no bracket-tagged parts to bulk-edit");
             return;
         }
+        let tags = tags.into_iter().map(|(tag, count)| { let material = self.project.autofill.get(&tag).cloned(); (tag, count, material) }).collect();
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         self.bulk = Some(BulkState::PickTag { tags, list_state });
     }
 
-    /// Stage 1 -> 2: the selected tag becomes stage 2's confirmation
-    /// summary (count + current material spread among that tag's parts).
+    /// Enter on the tag list hands off straight to the shared material
+    /// picker (`PickerTarget::Tag`), which is what actually writes the
+    /// project's `autofill` rule once a material is chosen (see
+    /// `confirm_picker`). `self.bulk` is deliberately left in place --
+    /// cancelling or confirming the picker returns to this same tag list.
     fn bulk_pick_tag(&mut self) {
         let Some(BulkState::PickTag { tags, list_state }) = &self.bulk else { return };
         let Some(i) = list_state.selected() else { return };
-        let (tag, count) = tags[i].clone();
-        let spread = material_spread(&self.parts, &tag);
-        self.bulk = Some(BulkState::ConfirmTag { tag, count, spread });
-    }
-
-    /// Stage 2 -> 3: hands off to the ordinary material picker
-    /// (`PickerTarget::Tag`), which is what actually writes the project's
-    /// `autofill` rule once a material is chosen (see `confirm_picker`).
-    fn bulk_confirm_tag(&mut self) {
-        let Some(BulkState::ConfirmTag { tag, .. }) = self.bulk.take() else { return };
+        let tag = tags[i].0.clone();
         let mut options: Vec<String> = self.materials.iter().map(|m| m.name.clone()).collect();
         options.sort();
         options.insert(0, "(clear -- remove this tag's rule)".to_string());
+        let current_index = match self.project.autofill.get(&tag) {
+            None => 0,
+            Some(name) => options.iter().position(|o| o == name).unwrap_or(0),
+        };
         let mut list_state = ListState::default();
-        list_state.select(Some(0));
+        list_state.select(Some(current_index));
         self.picker = Some(PickerState { target: PickerTarget::Tag(tag), options, list_state });
     }
 
@@ -548,11 +553,10 @@ impl App {
     /// for `self.parts[i]` from its raw dims, current material, and swap
     /// state -- call after mutating either (see `resolve_dims`).
     fn resolve_part_dims(&mut self, i: usize) {
-        let material_name = self.parts[i].material.clone();
-        let material = material_name.as_deref().and_then(|name| self.materials.iter().find(|m| m.name == name));
+        let material = self.parts[i].material.clone();
         let raw = (self.parts[i].raw_length_in, self.parts[i].raw_width_in, self.parts[i].raw_thickness_in);
         let swapped = self.parts[i].swapped;
-        let (length_in, width_in, thickness_in, thickness_mismatch) = resolve_dims(raw, material, swapped);
+        let (length_in, width_in, thickness_in, thickness_mismatch) = resolve_dims(raw, material.as_ref(), swapped);
         let part = &mut self.parts[i];
         part.length_in = length_in;
         part.width_in = width_in;
@@ -568,7 +572,7 @@ impl App {
             PickerTarget::Part(i) => {
                 match chosen {
                     Some(name) => {
-                        self.parts[i].material = Some(name);
+                        self.parts[i].material = Some(find_material(&self.materials, &name).clone());
                         self.parts[i].is_exception = true;
                     }
                     None => {
@@ -577,7 +581,8 @@ impl App {
                         // unassigned. Never records a standalone "no
                         // material" exception.
                         self.parts[i].is_exception = false;
-                        self.parts[i].material = autofill::guess_material(&self.parts[i].path, &self.project.autofill);
+                        self.parts[i].material =
+                            autofill::guess_material(&self.parts[i].path, &self.project.autofill).map(|name| find_material(&self.materials, &name).clone());
                     }
                 }
                 self.resolve_part_dims(i);
@@ -593,9 +598,14 @@ impl App {
                         self.project.autofill.remove(&tag);
                     }
                 }
-                let changed = apply_bulk_material(&mut self.parts, &self.project.autofill);
+                let changed = apply_bulk_material(&mut self.parts, &self.project.autofill, &self.materials);
                 for i in &changed {
                     self.resolve_part_dims(*i);
+                }
+                if let Some(BulkState::PickTag { tags, .. }) = &mut self.bulk {
+                    if let Some(entry) = tags.iter_mut().find(|(t, _, _)| *t == tag) {
+                        entry.2 = chosen.clone();
+                    }
                 }
                 self.dirty = true;
                 self.set_status(format!("updated the {tag} rule -- {} part(s) changed", changed.len()));
@@ -622,7 +632,7 @@ impl App {
                 // A rule-derived material is never frozen into an
                 // exception -- only `is_exception` (an explicit per-part
                 // override) persists. See `Part::is_exception`.
-                let material = if p.is_exception { p.material.clone() } else { None };
+                let material = if p.is_exception { p.material.as_ref().map(|m| m.name.clone()) } else { None };
                 let over = PartOverride { material, swapped: p.swapped };
                 if over.is_empty() { None } else { Some((p.assignment_key.clone(), over)) }
             })
@@ -718,6 +728,7 @@ impl App {
 pub(crate) fn run(project: Project, project_path: PathBuf, global_stock: Vec<StockSheet>) -> Result<(), Box<dyn Error>> {
     let global_materials = stock::distinct_materials(&global_stock);
     let materials = project.resolve_materials(&global_materials)?;
+    project.validate_references(&materials)?;
     let stock_subset = project.resolve_stock(&global_stock);
     let step_path = project.step_path(&project_path);
 
@@ -817,15 +828,6 @@ pub(crate) fn run(project: Project, project_path: PathBuf, global_stock: Vec<Sto
                             list_state.select(Some(next));
                         }
                     }
-                    _ => {}
-                }
-                continue;
-            }
-
-            if matches!(app.bulk, Some(BulkState::ConfirmTag { .. })) {
-                match key.code {
-                    KeyCode::Esc => app.bulk = None,
-                    KeyCode::Enter => app.bulk_confirm_tag(),
                     _ => {}
                 }
                 continue;
@@ -934,7 +936,7 @@ mod tests {
             thickness_in,
             unreliable,
             thickness_mismatch: false,
-            material: material.map(str::to_string),
+            material: material.map(|name| Material { name: name.to_string(), thickness_mm: thickness_in * MM_PER_IN }),
             is_exception: material.is_some(),
             swapped: false,
         }
@@ -1075,12 +1077,12 @@ mod tests {
     fn save_persists_an_exception_but_never_a_rule_derived_material() {
         let mut exception = part(0.75, Some("Baltic Birch 3/4"), false);
         exception.is_exception = true;
-        let saved = if exception.is_exception { exception.material.clone() } else { None };
+        let saved = if exception.is_exception { exception.material.as_ref().map(|m| m.name.clone()) } else { None };
         assert_eq!(saved, Some("Baltic Birch 3/4".to_string()));
 
         let mut rule_derived = part(0.75, Some("Baltic Birch 3/4"), false);
         rule_derived.is_exception = false;
-        let saved = if rule_derived.is_exception { rule_derived.material.clone() } else { None };
+        let saved = if rule_derived.is_exception { rule_derived.material.as_ref().map(|m| m.name.clone()) } else { None };
         assert_eq!(saved, None, "a rule-derived material is never frozen into an exception on save");
     }
 
@@ -1111,51 +1113,42 @@ mod tests {
     }
 
     #[test]
-    fn material_spread_only_counts_parts_carrying_the_tag_most_common_first() {
-        let parts = vec![
-            tagged_part("Bench / [Panel] A", Some("Baltic Birch 3/4")),
-            tagged_part("Bench / [Panel] B", Some("Baltic Birch 3/4")),
-            tagged_part("Bench / [Panel] C", None),
-            tagged_part("Bench / [Backer] D", Some("Sande Ply 3/4")), // different tag, excluded
-        ];
-        let spread = material_spread(&parts, "[Panel]");
-        assert_eq!(spread, vec![(Some("Baltic Birch 3/4".to_string()), 2), (None, 1)]);
-    }
-
-    #[test]
     fn apply_bulk_material_re_resolves_every_non_exception_part_from_the_current_rule() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
         let mut parts = vec![tagged_part("Bench / [Panel] A", None)];
         parts[0].is_exception = false;
         let mut autofill_map = BTreeMap::new();
         autofill_map.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
 
-        let changed = apply_bulk_material(&mut parts, &autofill_map);
+        let changed = apply_bulk_material(&mut parts, &autofill_map, &materials);
 
         assert_eq!(changed, vec![0]);
-        assert_eq!(parts[0].material.as_deref(), Some("Baltic Birch 3/4"));
+        assert_eq!(parts[0].material.as_ref().map(|m| m.name.as_str()), Some("Baltic Birch 3/4"));
         assert!(!parts[0].is_exception, "bulk-edit updates the rule, never stamps a per-part exception");
     }
 
     #[test]
     fn apply_bulk_material_never_touches_a_part_with_its_own_exception() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75), material("Sande Ply 3/4", 0.75)];
         let mut parts = vec![tagged_part("Bench / [Panel] A", Some("Sande Ply 3/4"))];
         parts[0].is_exception = true;
         let mut autofill_map = BTreeMap::new();
         autofill_map.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
 
-        let changed = apply_bulk_material(&mut parts, &autofill_map);
+        let changed = apply_bulk_material(&mut parts, &autofill_map, &materials);
 
         assert!(changed.is_empty());
-        assert_eq!(parts[0].material.as_deref(), Some("Sande Ply 3/4"), "an exception always outranks the rule, even after the rule changes");
+        assert_eq!(parts[0].material.as_ref().map(|m| m.name.as_str()), Some("Sande Ply 3/4"), "an exception always outranks the rule, even after the rule changes");
     }
 
     #[test]
     fn apply_bulk_material_removing_a_rule_unassigns_its_non_exception_parts() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
         let mut parts = vec![tagged_part("Bench / [Panel] A", Some("Baltic Birch 3/4"))];
         parts[0].is_exception = false;
         // No rule in the map at all -- simulates the rule having just
         // been removed via bulk-edit's "(clear)".
-        let changed = apply_bulk_material(&mut parts, &BTreeMap::new());
+        let changed = apply_bulk_material(&mut parts, &BTreeMap::new(), &materials);
         assert_eq!(changed, vec![0]);
         assert_eq!(parts[0].material, None);
     }

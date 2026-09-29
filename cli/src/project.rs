@@ -109,6 +109,72 @@ impl Project {
     pub(crate) fn resolve_stock(&self, global: &[StockSheet]) -> Vec<StockSheet> {
         global.iter().filter(|s| self.materials.iter().any(|m| m == &s.material.name)).cloned().collect()
     }
+
+    /// Every `autofill` value and `assignments[].material` must name a
+    /// material in `materials` (this project's own subset, already
+    /// resolved against the global catalog by `resolve_materials`) --
+    /// not just the wider global catalog, since a project deliberately
+    /// narrows which materials it uses. Call this right after
+    /// `resolve_materials`, before parts are ever loaded.
+    ///
+    /// Unlike `materials` above and a stock sheet's own `material:`
+    /// field, these two maps were never checked against the catalog at
+    /// all: a typo'd or stale name in either one used to flow silently
+    /// into a part's displayed material (`review::resolve_material`
+    /// trusts a name it's handed) instead of failing loudly here, where
+    /// it can name the offending file key instead of just leaving a part
+    /// mysteriously unresolved.
+    pub(crate) fn validate_references(&self, materials: &[Material]) -> Result<(), Box<dyn Error>> {
+        let known: Vec<&str> = materials.iter().map(|m| m.name.as_str()).collect();
+        for (tag, name) in &self.autofill {
+            if !known.contains(&name.as_str()) {
+                return Err(unresolved_material_err(&format!("autofill rule {tag:?}"), name, &known));
+            }
+        }
+        for (key, over) in &self.assignments {
+            if let Some(name) = &over.material {
+                if !known.contains(&name.as_str()) {
+                    return Err(unresolved_material_err(&format!("assignment for {key:?}"), name, &known));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn unresolved_material_err(context: &str, name: &str, known: &[&str]) -> Box<dyn Error> {
+    let suggestion = closest_match(name, known).map(|m| format!(" (did you mean {m:?}?)")).unwrap_or_default();
+    format!("storystick.yaml: {context} -> material {name:?} not found in this project's materials{suggestion}").into()
+}
+
+/// The closest of `candidates` to `target` by edit distance, if any comes
+/// within a third of `target`'s own length -- close enough to plausibly
+/// be a typo of it, not just some other, unrelated material name. Exists
+/// purely to make `validate_references`' error actionable (point at the
+/// likely intended name); never used to *resolve* a reference -- an
+/// inexact match must never silently stand in for an exact one.
+fn closest_match<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let max_distance = (target.chars().count() / 3).max(1);
+    candidates.iter().map(|c| (*c, levenshtein(target, c))).filter(|(_, d)| *d <= max_distance).min_by_key(|(_, d)| *d).map(|(c, _)| c)
+}
+
+/// Classic edit distance, one DP row kept at a time -- no crate dependency
+/// worth pulling in for a helper this small, used only for a "did you
+/// mean" suggestion.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        curr[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
 }
 
 fn project_dir(project_file: &Path) -> &Path {
@@ -268,6 +334,59 @@ assignments:
         let resolved = project.resolve_stock(&global);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].material.name, "Baltic Birch 3/4");
+    }
+
+    #[test]
+    fn validate_references_passes_when_autofill_and_assignments_name_real_materials() {
+        let materials = vec![material("Baltic Birch 3/4", 19.05), material("Sande Ply 3/4", 19.05)];
+        let mut autofill = BTreeMap::new();
+        autofill.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
+        let mut assignments = BTreeMap::new();
+        assignments.insert("Bench / Body".to_string(), PartOverride { material: Some("Sande Ply 3/4".to_string()), swapped: false });
+        let project = Project {
+            step: "model.step".to_string(),
+            materials: vec!["Baltic Birch 3/4".to_string(), "Sande Ply 3/4".to_string()],
+            autofill,
+            settings: Settings::default(),
+            assignments,
+        };
+        assert!(project.validate_references(&materials).is_ok());
+    }
+
+    #[test]
+    fn validate_references_errs_and_suggests_the_close_name_for_a_typo_d_autofill_rule() {
+        let materials = vec![material("Baltic Birch 3/4", 19.05)];
+        let mut autofill = BTreeMap::new();
+        autofill.insert("[Panel]".to_string(), "Baltic Brich 3/4".to_string());
+        let project = Project {
+            step: "model.step".to_string(),
+            materials: vec!["Baltic Birch 3/4".to_string()],
+            autofill,
+            settings: Settings::default(),
+            assignments: BTreeMap::new(),
+        };
+        let err = project.validate_references(&materials).unwrap_err().to_string();
+        assert!(err.contains("[Panel]"), "should name the offending rule: {err}");
+        assert!(err.contains("Baltic Brich 3/4"), "should name the bad value: {err}");
+        assert!(err.contains("did you mean \"Baltic Birch 3/4\""), "should suggest the close match: {err}");
+    }
+
+    #[test]
+    fn validate_references_errs_on_an_unknown_assignment_material_with_no_suggestion_when_nothing_is_close() {
+        let materials = vec![material("Baltic Birch 3/4", 19.05)];
+        let mut assignments = BTreeMap::new();
+        assignments.insert("Bench / Body".to_string(), PartOverride { material: Some("Oak".to_string()), swapped: false });
+        let project = Project {
+            step: "model.step".to_string(),
+            materials: vec!["Baltic Birch 3/4".to_string()],
+            autofill: BTreeMap::new(),
+            settings: Settings::default(),
+            assignments,
+        };
+        let err = project.validate_references(&materials).unwrap_err().to_string();
+        assert!(err.contains("Bench / Body"), "should name the offending assignment key: {err}");
+        assert!(err.contains("Oak"), "should name the bad value: {err}");
+        assert!(!err.contains("did you mean"), "\"Oak\" isn't a plausible typo of \"Baltic Birch 3/4\": {err}");
     }
 
     #[test]

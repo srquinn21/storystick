@@ -197,7 +197,7 @@ pub(super) fn header_line() -> Line<'static> {
 fn leaf_line(part: &Part, flagged: bool, depth: usize) -> Line<'static> {
     let name = part.path.rsplit(" / ").next().unwrap_or(&part.path);
     let marker = if flagged { "! " } else { "  " };
-    let material = part.material.as_deref().unwrap_or("-");
+    let material = part.material.as_ref().map(|m| m.name.as_str()).unwrap_or("-");
     let left = format!("{}{marker}{name:<NAME_FIELD_WIDTH$}", depth_indent(depth));
     let measurements = format!(" {:>9.4}  {:>9.4}  {:>8.4} ", part.length_in, part.width_in, part.thickness_in);
     let material = format!(" {material}");
@@ -327,7 +327,7 @@ mod tests {
             part("Bench / Carcasses / Carcass A / Resolved"),
             part("Bench / Doors / Door A / Flagged"),
         ];
-        parts[1].material = Some("Baltic Birch 3/4".to_string());
+        parts[1].material = Some(material("Baltic Birch 3/4", 0.75));
 
         let (order, children) = build_nodes(&parts);
         assert_eq!(count_flagged(&order, &children, &parts, &materials), 2, "two of the three parts have no material assigned");
@@ -338,7 +338,7 @@ mod tests {
         let materials = vec![material("Baltic Birch 3/4", 0.75)];
         let mut parts = vec![part("Bench / A"), part("Bench / B")];
         for p in &mut parts {
-            p.material = Some("Baltic Birch 3/4".to_string());
+            p.material = Some(material("Baltic Birch 3/4", 0.75));
         }
 
         let (order, children) = build_nodes(&parts);

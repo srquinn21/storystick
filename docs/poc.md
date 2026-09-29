@@ -196,6 +196,36 @@ user-authored rule the primary mechanism instead of a guess:
 
 **Implemented.**
 
+### Validated material references
+
+A material name is retyped, independently, in up to five places: the
+global catalog's own `materials`/`sheets` cross-reference, a project's
+`materials:` subset, and a project's `autofill:`/`assignments:` values.
+Only two of those five were ever checked against the catalog at load
+time (`stock::parse`'s sheet lookup, `Project::resolve_materials`) --
+`autofill:`/`assignments:` values flowed straight from YAML into
+`Part.material` unchecked. A typo there didn't error: it produced a part
+displaying an unresolvable material name, not flagged "no material
+assigned" (the field wasn't empty), silently wrong.
+
+Considered introducing a stable material `id` distinct from the display
+name (so renaming a material's label can't break a reference). Rejected
+for now -- more ceremony than a small, hand-edited catalog format
+warrants, and the actual bug isn't that names double as identity, it's
+that referential integrity was checked inconsistently.
+
+**Resolved:** `Project::validate_references`, called once right after
+`resolve_materials` (before parts ever load), checks every `autofill`
+value and `assignments[].material` against the project's own resolved
+material subset, erroring with the offending key and a Levenshtein-based
+"did you mean" suggestion on a near-miss. A bad or stale name is now a
+loud failure at startup on every path, not just two of five.
+`review::Part.material` was also changed from a bare `Option<String>` to
+`Option<Material>`, resolved once (`review::find_material`) right after
+that validation passes, so downstream code (dimension correction, the
+picker, bulk-edit) carries a real `Material` instead of re-searching the
+catalog by name at each use site. **Implemented.**
+
 ### Bulk-edit mode (by tag)
 
 Proposed to handle scale once a project is one big export: a mode that
