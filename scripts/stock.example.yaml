@@ -14,15 +14,22 @@
 #     repeated here, so two sizes of the same material can't drift.
 #
 # To route a specific part to a specific material (e.g. keep a hidden
-# stretcher off the good plywood), set that row's `material` column in
-# parts.csv to the material's name below. Left blank, a part matches any
-# material at its own measured thickness -- the common case.
+# stretcher off the good plywood), assign that material to the part in
+# the review TUI. Left unassigned, a part matches any material at its own
+# measured thickness -- the common case.
+#
+# `match:` (optional, per material) lists the Shapr3D `[Bracket]` tags
+# that should seed this material as a part's initial guess on load -- a
+# starting point only, the review TUI's flag/correct workflow still
+# catches anything it missed or got wrong.
 
 materials:
   - name: "Baltic Birch 3/4 (finished 2 sides)"
     thickness_in: 0.75
+    match: ["[Panel]"]
   - name: "Sande Ply 3/4 (utility, unseen parts)"
     thickness_in: 0.75
+    match: ["[Backer]"]
   - name: "Baltic Birch 1/4"
     thickness_in: 0.25
 

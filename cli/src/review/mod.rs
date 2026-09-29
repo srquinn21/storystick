@@ -22,15 +22,16 @@ mod tree;
 mod ui;
 
 use crate::assignments::PartOverride;
-use crate::{assignments, round4, stock, MM_PER_IN};
+use crate::{assignments, autofill, round4, stock, MM_PER_IN};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use storystick_core::nesting::{bill_of_materials, pack, Material, PackablePart, StockSheet};
+use storystick_core::nesting::{pack, Material, PackablePart, StockSheet};
 use storystick_core::stepcrawl::{extract_parts, relabel_with_known_thickness};
+use storystick_core::tags;
 use tui_tree_widget::TreeState;
 
 /// How far a part's own measured thickness may sit from a candidate
@@ -103,6 +104,15 @@ pub(crate) struct Part {
     /// looks like), not just a missed correction. See `resolve_dims`.
     pub thickness_mismatch: bool,
     pub material: Option<String>,
+    /// Whether `material` reflects a decision the user actually made
+    /// (via the picker or bulk-edit, including deliberately clearing it
+    /// back to `None`) rather than just a bracket-token autofill guess
+    /// (see `crate::autofill`) or the plain "nothing assigned yet"
+    /// default. Mirrors `assignments::PartOverride.material`'s outer
+    /// `Option` -- see that field's docs for why the distinction exists.
+    /// `save` only persists a material override when this is true, so an
+    /// unreviewed autofill guess is never frozen into the sidecar.
+    pub material_decided: bool,
     /// Grain always runs with length (see this module's docs); this says
     /// whether length/width, as guessed, have been swapped so the part's
     /// other edge runs with the grain instead.
@@ -174,6 +184,69 @@ fn compatible_materials<'a>(materials: &'a [Material], thickness_in: f64) -> Vec
     materials.iter().filter(|m| (m.thickness_mm / MM_PER_IN - thickness_in).abs() <= COMPATIBLE_THICKNESS_TOLERANCE_IN).collect()
 }
 
+/// Every distinct bracket tag across `parts`' paths, with how many parts
+/// carry it -- first-appearance order (not sorted by count), so a tag's
+/// position in the list roughly tracks where it first shows up in the
+/// tree rather than jumping around as counts change. A part carrying the
+/// same tag twice in its own path (an odd but possible nesting) only
+/// counts once toward that tag's total.
+fn distinct_tags(parts: &[Part]) -> Vec<(String, usize)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for part in parts {
+        let mut seen_in_part = std::collections::HashSet::new();
+        for tag in tags::extract_tags(&part.path) {
+            if seen_in_part.insert(tag.clone()) {
+                if !counts.contains_key(&tag) {
+                    order.push(tag.clone());
+                }
+                *counts.entry(tag).or_insert(0) += 1;
+            }
+        }
+    }
+    order.into_iter().map(|tag| { let count = counts[&tag]; (tag, count) }).collect()
+}
+
+/// The current material distribution among every part carrying `tag`,
+/// most-common first -- the "current material spread" a bulk-edit
+/// confirmation summary shows before a mass write, so it's never a blind
+/// overwrite of parts that might already disagree with each other.
+fn material_spread(parts: &[Part], tag: &str) -> Vec<(Option<String>, usize)> {
+    let mut order: Vec<Option<String>> = Vec::new();
+    let mut counts: HashMap<Option<String>, usize> = HashMap::new();
+    for part in parts {
+        if tags::extract_tags(&part.path).iter().any(|t| t == tag) {
+            let key = part.material.clone();
+            if !counts.contains_key(&key) {
+                order.push(key.clone());
+            }
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let mut spread: Vec<(Option<String>, usize)> = order.into_iter().map(|key| { let count = counts[&key]; (key, count) }).collect();
+    spread.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    spread
+}
+
+/// Sets `material` on every part carrying `tag` (and marks it decided --
+/// see `Part::material_decided`), returning the indices actually changed
+/// so the caller can re-derive each one's dims (`resolve_part_dims`) and
+/// mark the session dirty. Unlike the single-part picker path, this never
+/// calls `resolve_part_dims` itself: a mass write's dimension-resolution
+/// is still a per-part operation, one part at a time, just triggered from
+/// a batch of indices instead of one selection.
+fn apply_bulk_material(parts: &mut [Part], tag: &str, material: Option<&str>) -> Vec<usize> {
+    let mut changed = Vec::new();
+    for (i, part) in parts.iter_mut().enumerate() {
+        if tags::extract_tags(&part.path).iter().any(|t| t == tag) {
+            part.material = material.map(str::to_string);
+            part.material_decided = true;
+            changed.push(i);
+        }
+    }
+    changed
+}
+
 /// A part is flagged when its geometry was ambiguous (`unreliable`, set
 /// by stepcrawl when a face-normal-based dimension guess couldn't be made
 /// confidently), when its assigned material's thickness doesn't actually
@@ -205,7 +278,21 @@ pub(crate) fn part_flag(part: &Part, materials: &[Material]) -> Option<&'static 
     None
 }
 
-fn load_parts(step_path: &Path, overrides: &BTreeMap<String, PartOverride>, materials: &[Material]) -> Result<Vec<Part>, Box<dyn Error>> {
+/// The material an override entry itself decided, distinguishing "no
+/// entry, or an entry that never touched material" (never decided --
+/// `load_parts` is free to seed an autofill guess) from an entry that
+/// records a real decision, assigned or explicitly cleared. See
+/// `PartOverride.material`'s docs.
+fn decided_material(over: Option<&PartOverride>) -> Option<Option<String>> {
+    over.and_then(|o| o.material.clone())
+}
+
+fn load_parts(
+    step_path: &Path,
+    overrides: &BTreeMap<String, PartOverride>,
+    materials: &[Material],
+    tag_materials: &HashMap<String, String>,
+) -> Result<Vec<Part>, Box<dyn Error>> {
     let groups = extract_parts(step_path)?;
     let mut parts = Vec::new();
     for group in &groups {
@@ -215,7 +302,19 @@ fn load_parts(step_path: &Path, overrides: &BTreeMap<String, PartOverride>, mate
             let raw_thickness_in = round4(group.thickness_mm / MM_PER_IN);
             let key = assignment_key(&instance.path, raw_length_in, raw_width_in, raw_thickness_in);
             let over = overrides.get(&key);
-            let material = over.and_then(|o| o.material.clone());
+            let (material, material_decided) = match decided_material(over) {
+                Some(name) => (name, true),
+                None => {
+                    // Never decided -- seed a bracket-token guess, but
+                    // only if it's actually thickness-compatible with
+                    // this part: a guess that would immediately flag as
+                    // a mismatch is worse than no guess at all (see
+                    // `crate::autofill`'s docs).
+                    let guess = autofill::guess_material(&instance.path, tag_materials)
+                        .filter(|name| compatible_materials(materials, raw_thickness_in).iter().any(|m| &m.name == name));
+                    (guess, false)
+                }
+            };
             let swapped = over.map(|o| o.swapped).unwrap_or(false);
             let material_ref = material.as_deref().and_then(|name| materials.iter().find(|m| m.name == name));
             let (length_in, width_in, thickness_in, thickness_mismatch) =
@@ -232,6 +331,7 @@ fn load_parts(step_path: &Path, overrides: &BTreeMap<String, PartOverride>, mate
                 unreliable: instance.unreliable,
                 thickness_mismatch,
                 material,
+                material_decided,
                 swapped,
             });
         }
@@ -239,10 +339,32 @@ fn load_parts(step_path: &Path, overrides: &BTreeMap<String, PartOverride>, mate
     Ok(parts)
 }
 
+/// What a confirmed `PickerState` choice applies to -- a single selected
+/// part, or every part carrying a bulk-edit tag (see `BulkState`). Both
+/// paths end up at the same picker UI and the same `confirm_picker`,
+/// which is the whole point: bulk-edit reuses the material picker rather
+/// than growing a second one, per docs/poc.md's own framing of it as
+/// "the existing picker UI."
+pub(crate) enum PickerTarget {
+    Part(usize),
+    Tag(String),
+}
+
 pub(crate) struct PickerState {
-    pub(crate) part_index: usize,
+    pub(crate) target: PickerTarget,
     pub(crate) options: Vec<String>,
     pub(crate) list_state: ListState,
+}
+
+/// Bulk-edit-by-tag's own two stages, ahead of the shared material
+/// picker: pick which tag to act on, then see a summary (how many parts,
+/// what they're currently set to) before that mass write is even offered
+/// a material to apply -- see docs/poc.md's "confirmation summary first."
+/// Choosing a material happens via `App::picker` (`PickerTarget::Tag`),
+/// not a third variant here.
+pub(crate) enum BulkState {
+    PickTag { tags: Vec<(String, usize)>, list_state: ListState },
+    ConfirmTag { tag: String, count: usize, spread: Vec<(Option<String>, usize)> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -285,6 +407,7 @@ pub(crate) struct App {
     /// `default_status` (or hasn't been touched since it last reverted).
     status_message_at: Option<Instant>,
     pub(crate) picker: Option<PickerState>,
+    pub(crate) bulk: Option<BulkState>,
     pub(crate) print_settings: Option<PrintSettings>,
     /// True while the "save before exiting?" popup is up -- set when `q`
     /// or `Esc` is pressed with `dirty` still true, instead of quitting
@@ -371,7 +494,44 @@ impl App {
         };
         let mut list_state = ListState::default();
         list_state.select(Some(current_index));
-        self.picker = Some(PickerState { part_index: i, options, list_state });
+        self.picker = Some(PickerState { target: PickerTarget::Part(i), options, list_state });
+    }
+
+    /// Opens bulk-edit's tag list (stage 1 of 3 -- see `BulkState`), or
+    /// reports there's nothing to bulk-edit if no part in the whole tree
+    /// carries a bracket tag at all.
+    fn open_bulk_edit(&mut self) {
+        let tags = distinct_tags(&self.parts);
+        if tags.is_empty() {
+            self.set_status("no bracket-tagged parts to bulk-edit");
+            return;
+        }
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        self.bulk = Some(BulkState::PickTag { tags, list_state });
+    }
+
+    /// Stage 1 -> 2: the selected tag becomes stage 2's confirmation
+    /// summary (count + current material spread among that tag's parts).
+    fn bulk_pick_tag(&mut self) {
+        let Some(BulkState::PickTag { tags, list_state }) = &self.bulk else { return };
+        let Some(i) = list_state.selected() else { return };
+        let (tag, count) = tags[i].clone();
+        let spread = material_spread(&self.parts, &tag);
+        self.bulk = Some(BulkState::ConfirmTag { tag, count, spread });
+    }
+
+    /// Stage 2 -> 3: hands off to the ordinary material picker
+    /// (`PickerTarget::Tag`), which is what actually applies the mass
+    /// write once a material is chosen (see `confirm_picker`).
+    fn bulk_confirm_tag(&mut self) {
+        let Some(BulkState::ConfirmTag { tag, .. }) = self.bulk.take() else { return };
+        let mut options: Vec<String> = self.materials.iter().map(|m| m.name.clone()).collect();
+        options.sort();
+        options.insert(0, "(clear -- match by thickness alone)".to_string());
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        self.picker = Some(PickerState { target: PickerTarget::Tag(tag), options, list_state });
     }
 
     /// Recomputes `length_in`/`width_in`/`thickness_in`/`thickness_mismatch`
@@ -393,11 +553,24 @@ impl App {
     fn confirm_picker(&mut self) {
         let Some(picker) = self.picker.take() else { return };
         let Some(choice) = picker.list_state.selected() else { return };
-        let chosen = picker.options[choice].clone();
-        self.parts[picker.part_index].material = if choice == 0 { None } else { Some(chosen) };
-        self.resolve_part_dims(picker.part_index);
-        self.dirty = true;
-        self.set_status(format!("set material for {}", self.parts[picker.part_index].path));
+        let chosen = if choice == 0 { None } else { Some(picker.options[choice].clone()) };
+        match picker.target {
+            PickerTarget::Part(i) => {
+                self.parts[i].material = chosen;
+                self.parts[i].material_decided = true;
+                self.resolve_part_dims(i);
+                self.dirty = true;
+                self.set_status(format!("set material for {}", self.parts[i].path));
+            }
+            PickerTarget::Tag(tag) => {
+                let changed = apply_bulk_material(&mut self.parts, &tag, chosen.as_deref());
+                for i in &changed {
+                    self.resolve_part_dims(*i);
+                }
+                self.dirty = true;
+                self.set_status(format!("set material for {} part(s) tagged {tag}", changed.len()));
+            }
+        }
     }
 
     fn toggle_swap(&mut self) {
@@ -416,7 +589,11 @@ impl App {
             .parts
             .iter()
             .filter_map(|p| {
-                let over = PartOverride { material: p.material.clone(), swapped: p.swapped };
+                // An undecided autofill guess is never frozen into the
+                // sidecar -- only a real user decision (assigned or
+                // explicitly cleared) persists. See `Part::material_decided`.
+                let material = p.material_decided.then(|| p.material.clone());
+                let over = PartOverride { material, swapped: p.swapped };
                 if over.is_empty() { None } else { Some((p.assignment_key.clone(), over)) }
             })
             .collect();
@@ -491,8 +668,7 @@ impl App {
         let trim_allowance_mm = self.trim_allowance_in * MM_PER_IN;
         let layout = pack(&parts, &self.stock, self.kerf_in * MM_PER_IN, trim_allowance_mm);
         let unplaced = layout.unplaced.len();
-        let bom = bill_of_materials(&layout);
-        let pdf_bytes = storystick_core::diagrams::render_pdf(&layout, &bom, trim_allowance_mm);
+        let pdf_bytes = storystick_core::diagrams::render_pdf(&layout, trim_allowance_mm, crate::sections::classify, crate::sections::UNSECTIONED);
         match std::fs::write(&self.out_pdf_path, pdf_bytes) {
             Ok(()) => {
                 let msg = if unplaced == 0 {
@@ -511,10 +687,10 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
     let sidecar_path = assignments::sidecar_path(step_path);
     let existing_assignments = assignments::load(&sidecar_path)?;
 
-    let stock_list = stock::read(stock_path)?;
-    let materials = distinct_materials(&stock_list);
+    let catalog = stock::read(stock_path)?;
+    let materials = distinct_materials(&catalog.stock);
 
-    let parts = load_parts(step_path, &existing_assignments, &materials)?;
+    let parts = load_parts(step_path, &existing_assignments, &materials, &catalog.tag_materials)?;
 
     let tree_state = TreeState::default();
 
@@ -523,13 +699,14 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
         parts,
         selection_index: HashMap::new(),
         materials,
-        stock: stock_list,
+        stock: catalog.stock,
         tree_state,
         dirty: false,
         status: help_text.clone(),
         default_status: help_text,
         status_message_at: None,
         picker: None,
+        bulk: None,
         print_settings: None,
         confirm_quit: false,
         step_path: step_path.to_path_buf(),
@@ -587,6 +764,39 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
                             picker.list_state.select(Some(next));
                         }
                     }
+                    _ => {}
+                }
+                continue;
+            }
+
+            if matches!(app.bulk, Some(BulkState::PickTag { .. })) {
+                match key.code {
+                    KeyCode::Esc => app.bulk = None,
+                    KeyCode::Enter => app.bulk_pick_tag(),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if let Some(BulkState::PickTag { tags, list_state }) = &mut app.bulk {
+                            let len = tags.len();
+                            let cur = list_state.selected().unwrap_or(0) as i64;
+                            let next = (cur - 1).rem_euclid(len as i64) as usize;
+                            list_state.select(Some(next));
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if let Some(BulkState::PickTag { tags, list_state }) = &mut app.bulk {
+                            let len = tags.len();
+                            let next = (list_state.selected().unwrap_or(0) + 1) % len;
+                            list_state.select(Some(next));
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            if matches!(app.bulk, Some(BulkState::ConfirmTag { .. })) {
+                match key.code {
+                    KeyCode::Esc => app.bulk = None,
+                    KeyCode::Enter => app.bulk_confirm_tag(),
                     _ => {}
                 }
                 continue;
@@ -664,6 +874,7 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
                 }
                 KeyCode::Enter => app.handle_enter(),
                 KeyCode::Char('m') => app.open_picker(),
+                KeyCode::Char('b') => app.open_bulk_edit(),
                 KeyCode::Char('g') => app.toggle_swap(),
                 KeyCode::Char('s') => app.save(),
                 KeyCode::Char('p') => app.open_print_settings(),
@@ -694,6 +905,7 @@ mod tests {
             unreliable,
             thickness_mismatch: false,
             material: material.map(str::to_string),
+            material_decided: material.is_some(),
             swapped: false,
         }
     }
@@ -819,14 +1031,108 @@ mod tests {
     }
 
     #[test]
-    fn load_parts_applies_existing_sidecar_assignments_by_key() {
-        // Can't call extract_parts without a real STEP file here, but this
-        // is the same lookup load_parts performs against the sidecar --
-        // by assignment_key, not by bare path.
-        let mut p = part(0.75, None, false);
-        let mut assignments = BTreeMap::new();
-        assignments.insert(p.assignment_key.clone(), "Baltic Birch 3/4".to_string());
-        p.material = assignments.get(&p.assignment_key).cloned();
-        assert_eq!(p.material.as_deref(), Some("Baltic Birch 3/4"));
+    fn decided_material_is_none_when_no_override_entry_exists() {
+        // "Never decided" -- load_parts is free to seed an autofill guess.
+        assert_eq!(decided_material(None), None);
+    }
+
+    #[test]
+    fn decided_material_is_none_when_the_override_entry_never_touched_material() {
+        // A swap-only override entry still counts as "never decided" for
+        // material -- autofill is still free to seed a guess.
+        let over = PartOverride { material: None, swapped: true };
+        assert_eq!(decided_material(Some(&over)), None);
+    }
+
+    #[test]
+    fn decided_material_distinguishes_assigned_from_explicitly_cleared() {
+        let assigned = PartOverride { material: Some(Some("Baltic Birch 3/4".to_string())), swapped: false };
+        assert_eq!(decided_material(Some(&assigned)), Some(Some("Baltic Birch 3/4".to_string())));
+
+        let cleared = PartOverride { material: Some(None), swapped: false };
+        assert_eq!(decided_material(Some(&cleared)), Some(None));
+    }
+
+    #[test]
+    fn save_never_freezes_an_undecided_autofill_guess() {
+        // A part carrying only an autofill guess (material_decided: false)
+        // must not round-trip into a sidecar override -- otherwise a
+        // later stock.yaml change could never re-guess it.
+        let mut p = part(0.75, Some("Baltic Birch 3/4"), false);
+        p.material_decided = false;
+        let over = PartOverride { material: p.material_decided.then(|| p.material.clone()), swapped: p.swapped };
+        assert!(over.is_empty(), "an undecided guess must produce nothing worth saving");
+    }
+
+    #[test]
+    fn save_persists_an_explicit_decision_even_when_it_clears_the_material() {
+        let mut decided_none = part(0.75, None, false);
+        decided_none.material_decided = true;
+        let over = PartOverride { material: decided_none.material_decided.then(|| decided_none.material.clone()), swapped: false };
+        assert_eq!(over.material, Some(None), "an explicit clear must be saved as material: null, not omitted");
+    }
+
+    fn tagged_part(path: &str, material: Option<&str>) -> Part {
+        Part { path: path.to_string(), assignment_key: path.to_string(), ..part(0.75, material, false) }
+    }
+
+    #[test]
+    fn distinct_tags_counts_distinct_parts_in_first_appearance_order() {
+        let parts = vec![
+            tagged_part("Bench / [Panel] Bottom", None),
+            tagged_part("Bench / [Backer] Left", None),
+            tagged_part("Bench / [Panel] Top", None),
+        ];
+        assert_eq!(distinct_tags(&parts), vec![("[Panel]".to_string(), 2), ("[Backer]".to_string(), 1)]);
+    }
+
+    #[test]
+    fn distinct_tags_counts_a_part_carrying_the_same_tag_twice_only_once() {
+        let parts = vec![tagged_part("Bench / [Panel] Section / [Panel] Bottom", None)];
+        assert_eq!(distinct_tags(&parts), vec![("[Panel]".to_string(), 1)]);
+    }
+
+    #[test]
+    fn distinct_tags_is_empty_when_no_part_carries_a_bracket_tag() {
+        let parts = vec![tagged_part("Bench / Bottom", None)];
+        assert!(distinct_tags(&parts).is_empty());
+    }
+
+    #[test]
+    fn material_spread_only_counts_parts_carrying_the_tag_most_common_first() {
+        let parts = vec![
+            tagged_part("Bench / [Panel] A", Some("Baltic Birch 3/4")),
+            tagged_part("Bench / [Panel] B", Some("Baltic Birch 3/4")),
+            tagged_part("Bench / [Panel] C", None),
+            tagged_part("Bench / [Backer] D", Some("Sande Ply 3/4")), // different tag, excluded
+        ];
+        let spread = material_spread(&parts, "[Panel]");
+        assert_eq!(spread, vec![(Some("Baltic Birch 3/4".to_string()), 2), (None, 1)]);
+    }
+
+    #[test]
+    fn apply_bulk_material_only_changes_tagged_parts_and_marks_them_decided() {
+        let mut parts = vec![
+            tagged_part("Bench / [Panel] A", None),
+            tagged_part("Bench / [Backer] B", Some("Sande Ply 3/4")),
+            tagged_part("Bench / [Panel] C", Some("Baltic Birch 1/4")),
+        ];
+        let changed = apply_bulk_material(&mut parts, "[Panel]", Some("Baltic Birch 3/4"));
+
+        assert_eq!(changed, vec![0, 2]);
+        assert_eq!(parts[0].material.as_deref(), Some("Baltic Birch 3/4"));
+        assert!(parts[0].material_decided);
+        assert_eq!(parts[2].material.as_deref(), Some("Baltic Birch 3/4"));
+        assert!(parts[2].material_decided);
+        // The [Backer] part never carried the [Panel] tag -- untouched.
+        assert_eq!(parts[1].material.as_deref(), Some("Sande Ply 3/4"));
+    }
+
+    #[test]
+    fn apply_bulk_material_clear_choice_sets_material_none_but_still_decided() {
+        let mut parts = vec![tagged_part("Bench / [Panel] A", Some("Baltic Birch 3/4"))];
+        apply_bulk_material(&mut parts, "[Panel]", None);
+        assert_eq!(parts[0].material, None);
+        assert!(parts[0].material_decided, "an explicit bulk clear is still a decision, not a reset to undecided");
     }
 }

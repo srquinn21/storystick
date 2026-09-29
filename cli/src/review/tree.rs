@@ -259,6 +259,7 @@ mod tests {
             unreliable: false,
             thickness_mismatch: false,
             material: None,
+            material_decided: false,
             swapped: false,
         }
     }

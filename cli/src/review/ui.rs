@@ -1,4 +1,4 @@
-use super::{tree, App, PrintField};
+use super::{tree, App, BulkState, PickerTarget, PrintField};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -11,8 +11,25 @@ use tui_tree_widget::Tree;
 /// count here -- that's already the top-right title's `assigned` count
 /// (see `draw_tree`), and a bare `42` here with no unit would be a
 /// second, differently-shaped answer to the same question.
-const TREE_HELP: &[(&str, &str)] =
-    &[("j/k", "move"), ("h/l", "fold"), ("e/c", "expand/collapse all"), ("Enter/m", "assign"), ("g", "swap L/W"), ("Ctrl-d/u", "page"), ("s", "save"), ("p", "print"), ("q", "quit")];
+const TREE_HELP: &[(&str, &str)] = &[
+    ("j/k", "move"),
+    ("h/l", "fold"),
+    ("e/c", "expand/collapse all"),
+    ("Enter/m", "assign"),
+    ("b", "bulk edit"),
+    ("g", "swap L/W"),
+    ("Ctrl-d/u", "page"),
+    ("s", "save"),
+    ("p", "print"),
+    ("q", "quit"),
+];
+
+/// Shown on the bottom status line while bulk-edit's tag-picker (stage 1
+/// of 3 -- see `BulkState`) has focus.
+const BULK_TAG_HELP: &[(&str, &str)] = &[("j/k", "move"), ("Enter", "choose tag"), ("Esc", "cancel")];
+
+/// Shown while bulk-edit's confirmation summary (stage 2) has focus.
+const BULK_CONFIRM_HELP: &[(&str, &str)] = &[("Enter", "choose material"), ("Esc", "cancel")];
 
 /// Shown on the bottom status line (see `draw_status`) while the
 /// print-settings popup has focus, replacing the tree's own keyboard
@@ -65,6 +82,9 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.picker.is_some() {
         draw_picker(frame, area, app);
+    }
+    if app.bulk.is_some() {
+        draw_bulk(frame, area, app);
     }
     if app.print_settings.is_some() {
         draw_print_settings(frame, area, app);
@@ -140,6 +160,10 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         help_line(PRINT_HELP)
     } else if app.confirm_quit {
         help_line(QUIT_HELP)
+    } else if matches!(app.bulk, Some(BulkState::PickTag { .. })) {
+        help_line(BULK_TAG_HELP)
+    } else if matches!(app.bulk, Some(BulkState::ConfirmTag { .. })) {
+        help_line(BULK_CONFIRM_HELP)
     } else if app.status_is_default() {
         help_line(TREE_HELP)
     } else {
@@ -160,14 +184,53 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(picker) = &mut app.picker else { return };
     let popup = centered_rect(50, (picker.options.len() as u16 + 4).min(20), area);
 
+    let title = match &picker.target {
+        PickerTarget::Part(_) => " pick a material (Enter to confirm, Esc to cancel) ".to_string(),
+        PickerTarget::Tag(tag) => format!(" pick a material for every {tag} part (Enter to confirm, Esc to cancel) "),
+    };
     let items: Vec<ListItem> = picker.options.iter().map(|name| ListItem::new(name.as_str())).collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" pick a material (Enter to confirm, Esc to cancel) "))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol(">> ");
 
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, &mut picker.list_state);
+}
+
+/// Bulk-edit's two own stages (see `BulkState`) -- stage 3 (choosing the
+/// material) is just `draw_picker` with a `PickerTarget::Tag`, drawn
+/// separately once `App::bulk_confirm_tag` hands off to `App::picker`.
+fn draw_bulk(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(bulk) = &mut app.bulk else { return };
+    match bulk {
+        BulkState::PickTag { tags, list_state } => {
+            let popup = centered_rect(50, (tags.len() as u16 + 4).min(20), area);
+            let items: Vec<ListItem> = tags.iter().map(|(tag, count)| ListItem::new(format!("{tag}  ({count})"))).collect();
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(" bulk edit: pick a tag "))
+                .highlight_style(Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD))
+                .highlight_symbol(">> ");
+            frame.render_widget(Clear, popup);
+            frame.render_stateful_widget(list, popup, list_state);
+        }
+        BulkState::ConfirmTag { tag, count, spread } => {
+            let mut lines = vec![Line::from(""), Line::styled(format!(" {count} part(s) tagged {tag}"), Style::new().add_modifier(Modifier::BOLD))];
+            lines.push(Line::from(" currently:"));
+            for (material, n) in spread {
+                let label = material.as_deref().unwrap_or("(none)");
+                lines.push(Line::from(format!("   {n:>3}  {label}")));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::styled(" Enter to choose a material for all of them, Esc to cancel", Style::new().fg(Color::Yellow)));
+
+            let popup = centered_rect(56, lines.len() as u16 + 2, area);
+            let block = Block::default().borders(Borders::ALL).title(" bulk edit: confirm ");
+            let paragraph = Paragraph::new(lines).block(block);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(paragraph, popup);
+        }
+    }
 }
 
 fn draw_confirm_quit(frame: &mut Frame, area: Rect) {

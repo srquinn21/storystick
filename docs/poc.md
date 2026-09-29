@@ -44,13 +44,37 @@ and set aside in favor of this.
 - A ratatui TUI: browse the tree, see flagged (ambiguous / unassigned /
   thickness-mismatched) parts, assign material from a stock catalog,
   swap a part's length/width, adjust kerf/trim-allowance, and generate
-  the cutlist PDF (BOM + one labeled diagram per sheet).
+  the cutlist PDF.
+- Bracket-token material autofill: a stock-catalog material's optional
+  `match:` list of tokens (e.g. `match: ["[Panel]"]`) seeds an initial
+  material guess for any part whose path carries that token -- a
+  starting point only, never persisted to the sidecar unless the user
+  actually reviews and decides on it (see the sidecar note below).
+- Bulk-edit mode (`b`): lists every distinct bracket tag in the tree
+  with its part count, a confirmation summary (count + current material
+  spread) before committing, then applies one material choice to every
+  part carrying that tag via the same picker used for single-part
+  assignment. Material only, never the length/width swap -- grain
+  orientation stays a per-part decision.
 - A sidecar YAML persists material/swap overrides per part, keyed by
-  path + raw dimensions, auto-discovered next to the STEP file.
+  path + raw dimensions, auto-discovered next to the STEP file. The
+  sidecar distinguishes "never decided" (autofill is free to keep
+  guessing) from "explicitly set to no material" (`material: null`,
+  permanent) -- without this, a rejected autofill guess would be
+  indistinguishable from an unreviewed part and just come back next run.
 - Packing: a rip-first guillotine heuristic that prioritizes never
   stranding a sheet (or leaving an unusable remainder) over keeping
   same-size parts strictly grouped in adjacent strips -- confirmed on a
   real project (1/4" sheets went from 3 down to 2).
+- The cutlist PDF is organized for shop assembly, not as one flat
+  document: a whole-project Bill of Materials first, then per
+  construction-stage section (in build order) -- a front page (section
+  title + that section's own BOM + a blank ruled Notes area, since these
+  plans travel on a clipboard), that section's own cut-sheet pages, and
+  that section's own Parts Index (codes restart at P001 per section).
+  Construction stage is read off folder-naming keywords (Carcass, Door,
+  Face Frame, Drawer); no dedicated section title page, since the front
+  page already carries content worth the paper.
 - A recent polish pass: tree divider + column colors, a colored/
   right-justified title bar, a timed-out transient status line with a
   resting keyboard-help line, and a "save before exiting?" confirmation.
@@ -99,9 +123,15 @@ folder naming that carcasses already have ("Left Carcass", "Right
 Carcass", "Middle Carcass" -> "Left Door", "Face Frame Rail," etc.), so a
 full-project export's paths alone are enough to classify a part's
 construction stage. No separate "Projects"-selection-derived data is
-needed to reconstruct section grouping for the PDF -- the same
-keyword/tagging mechanism proposed for material tokens (below) doubles
-as the section classifier, one mechanism serving both needs.
+needed to reconstruct section grouping for the PDF -- construction-stage
+classification (`cli/src/sections.rs`) and bracket-token material
+matching (below) share the same "keyword found somewhere in a path"
+shape (`core::tags::classify_by_keyword` / `extract_tags`), just against
+plain folder-naming keywords instead of `[Bracket]` tokens, so the two
+features stay conceptually one mechanism even though they're two thin
+functions. **Implemented**: `core::diagrams::group_sheets_by_section`
+groups a `Layout`'s sheets by section, and `render_pdf` renders the PDF
+section by section (see "What's built today" above).
 
 ### Bracket-token conventions (`[Panel]`, `[Backer]`, etc.)
 
@@ -112,7 +142,12 @@ plywood," `[Backer]` implying "goes on cheap ply." Planned: an optional
 `match: ["[Panel]"]`), so `load_parts` seeds an initial material guess
 whenever a token appears in a part's path -- a starting point only; the
 existing flag/correct review workflow still catches anything the token
-missed or got wrong. **Not yet implemented.**
+missed or got wrong. **Implemented** (`cli/src/autofill.rs`,
+`cli/src/stock.rs`'s `match:` field). Only accepted when the guessed
+material is actually thickness-compatible with the part, and never
+frozen into the sidecar unless the user reviews it (see the sidecar
+tri-state note above) -- an unreviewed guess is free to change the next
+time stock.yaml does.
 
 ### Bulk-edit mode (by tag)
 
@@ -128,8 +163,8 @@ orientation is a per-part, per-position decision (it depends on where in
 the cabinet the part lands), not a uniform property of a tag like
 `[Panel]` the way "goes on show-face plywood" is -- bulk-swapping a
 whole tag group risks silently getting several parts' orientation wrong
-at once, a mistake bulk material assignment doesn't share. **Not yet
-implemented.**
+at once, a mistake bulk material assignment doesn't share. **Implemented**
+(key `b` in the review TUI).
 
 ### Tree UX at project scale
 
@@ -155,13 +190,13 @@ section once both of those are true.
 
 ## Status
 
-The "Open design thread" above is now settled design, not open
-questions -- but nothing there beyond what's listed in "What's built
-today" is implemented in `cli`/`core` yet. Next up: bracket-token
-material autofill, then bulk-edit by tag, then folder-name-based PDF
-section grouping; tree-scaling changes stay deferred per that section
-until both of those exist and get tried against a real full-project
-export. This document exists so this design survives a context reset;
-update it if a decision changes, and split a settled, load-bearing
-decision out into its own file once one exists (this repo's ADR
-convention, in `docs/decisions/`, applies to those).
+The "Open design thread" above is now settled design, and every part of
+it is implemented in `cli`/`core` except tree-scaling, which stays
+deferred per that section's own "resolved: deferred" -- it's now
+possible to try a real full-project export against bracket-token
+autofill, bulk-edit, and section-grouped PDF output all together, which
+is the trigger that section named for revisiting it. This document
+exists so this design survives a context reset; update it if a decision
+changes, and split a settled, load-bearing decision out into its own
+file once one exists (this repo's ADR convention, in
+`docs/decisions/`, applies to those).

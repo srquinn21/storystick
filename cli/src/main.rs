@@ -7,7 +7,9 @@
 //! runs is the path -> material assignment sidecar (see `assignments`).
 
 mod assignments;
+mod autofill;
 mod review;
+mod sections;
 mod stock;
 
 use clap::Parser;

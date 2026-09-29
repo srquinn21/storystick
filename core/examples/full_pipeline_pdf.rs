@@ -3,7 +3,7 @@
 //! Python reference on real project data.
 use std::path::PathBuf;
 use storystick_core::diagrams::render_pdf;
-use storystick_core::nesting::{bill_of_materials, pack, Material, PackablePart, StockSheet};
+use storystick_core::nesting::{pack, Material, PackablePart, StockSheet};
 
 const MM_PER_IN: f64 = 25.4;
 
@@ -42,9 +42,8 @@ fn main() {
 
     let kerf_mm = 0.125 * MM_PER_IN;
     let layout = pack(&parts, &stock, kerf_mm, 0.0);
-    let bom = bill_of_materials(&layout);
 
-    let pdf_bytes = render_pdf(&layout, &bom, 0.0);
+    let pdf_bytes = render_pdf(&layout, 0.0, |_path: &str| None, "Unsectioned");
     std::fs::write(&out_path, &pdf_bytes).expect("failed to write PDF");
     println!("wrote {} ({} bytes), {} sheets, {} unplaced", out_path, pdf_bytes.len(), layout.sheets.len(), layout.unplaced.len());
 }

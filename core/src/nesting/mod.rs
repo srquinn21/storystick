@@ -435,15 +435,22 @@ pub fn pack(parts: &[PackablePart], stock: &[StockSheet], kerf_mm: f64, trim_all
     Layout { sheets, unplaced }
 }
 
-/// Roll a Layout up into purchasing lines: how many of each StockSheet
-/// got used. Purely a count of `layout.sheets` grouped by stock -- there's
-/// no on-hand quantity to net out, since StockSheet is a catalog entry,
-/// not an inventory count (see `StockSheet`'s docs). Sorted by material
-/// name then thickness for a stable, readable BOM.
-pub fn bill_of_materials(layout: &Layout) -> Vec<BomLine> {
+/// Roll a set of sheets up into purchasing lines: how many of each
+/// StockSheet got used. Purely a count of `sheets` grouped by stock --
+/// there's no on-hand quantity to net out, since StockSheet is a catalog
+/// entry, not an inventory count (see `StockSheet`'s docs). Sorted by
+/// material name then thickness for a stable, readable BOM.
+///
+/// Takes any borrowed-`SheetLayout` iterator rather than a whole
+/// `&Layout`, so the exact same function produces both a whole-project
+/// BOM (`bill_of_materials(&layout.sheets)`) and a per-section BOM
+/// (`bill_of_materials(section_sheets)`, `section_sheets: Vec<&SheetLayout>`
+/// from `crate::diagrams::group_sheets_by_section`) with no duplicated
+/// counting logic -- see `crate::diagrams::render_pdf`.
+pub fn bill_of_materials<'a>(sheets: impl IntoIterator<Item = &'a SheetLayout>) -> Vec<BomLine> {
     let mut counts: HashMap<StockSheet, usize> = HashMap::new();
     let mut order: Vec<StockSheet> = Vec::new();
-    for sheet in &layout.sheets {
+    for sheet in sheets {
         if !counts.contains_key(&sheet.stock) {
             counts.insert(sheet.stock.clone(), 0);
             order.push(sheet.stock.clone());
@@ -534,7 +541,7 @@ mod tests {
             PackablePart::new("backer", 787.4, 431.8, 6.35),
         ];
         let layout = pack(&parts, &stock(), DEFAULT_KERF_MM, 0.0);
-        let bom = bill_of_materials(&layout);
+        let bom = bill_of_materials(&layout.sheets);
 
         let by_name: HashMap<&str, usize> = bom.iter().map(|l| (l.stock.material.name.as_str(), l.qty)).collect();
         assert_eq!(by_name["3/4 Baltic Birch"], 1, "both 30x16in pieces fit one 96x48in sheet with real packing");

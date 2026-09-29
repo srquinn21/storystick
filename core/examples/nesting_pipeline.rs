@@ -49,7 +49,7 @@ fn main() {
 
     let kerf_mm = 0.125 * MM_PER_IN;
     let layout = pack(&parts, &stock, kerf_mm, 0.0);
-    let bom = bill_of_materials(&layout);
+    let bom = bill_of_materials(&layout.sheets);
 
     println!("material,length_in,width_in,thickness_in,qty");
     for line in &bom {
