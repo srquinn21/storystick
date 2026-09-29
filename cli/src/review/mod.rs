@@ -28,6 +28,7 @@ use ratatui::widgets::ListState;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use storystick_core::nesting::{bill_of_materials, pack, Material, PackablePart, StockSheet};
 use storystick_core::stepcrawl::{extract_parts, relabel_with_known_thickness};
 use tui_tree_widget::TreeState;
@@ -44,6 +45,21 @@ use tui_tree_widget::TreeState;
 /// their nominal thickness (a lot of "3/4"" plywood is closer to 23/32"),
 /// so 0.06" of slack matters for the correction too, not just the picker.
 const COMPATIBLE_THICKNESS_TOLERANCE_IN: f64 = 0.06;
+
+/// How long a transient status message (a save/print confirmation, an
+/// error, "set material for ...") stays on screen before it's replaced
+/// with the resting keyboard-shortcut help text -- long enough to read,
+/// short enough that the help line (the thing you actually want visible
+/// most of the time, especially right after `s`) comes back on its own
+/// rather than staying clobbered until the next action happens to
+/// overwrite it.
+const STATUS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// How often the main loop wakes up with no key pressed, purely to check
+/// whether a transient status message has timed out (see
+/// `App::expire_status`) -- short enough that the help text's return
+/// feels prompt, long enough not to matter for CPU usage.
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) struct Part {
     pub path: String,
@@ -260,8 +276,21 @@ pub(crate) struct App {
     pub(crate) tree_state: TreeState<String>,
     pub(crate) dirty: bool,
     pub(crate) status: String,
+    /// The keyboard-shortcut help line `status` reverts to once a
+    /// transient message (see `set_status`) times out. Fixed at startup,
+    /// never itself passed through `set_status`, so it never expires.
+    default_status: String,
+    /// When the current `status` was set via `set_status`, so the main
+    /// loop knows when to revert it -- `None` means `status` is already
+    /// `default_status` (or hasn't been touched since it last reverted).
+    status_message_at: Option<Instant>,
     pub(crate) picker: Option<PickerState>,
     pub(crate) print_settings: Option<PrintSettings>,
+    /// True while the "save before exiting?" popup is up -- set when `q`
+    /// or `Esc` is pressed with `dirty` still true, instead of quitting
+    /// immediately, so an unsaved swap or material pick from earlier in
+    /// the session can't be lost to a reflexive quit keypress.
+    pub(crate) confirm_quit: bool,
     pub(crate) step_path: PathBuf,
     sidecar_path: PathBuf,
     out_pdf_path: PathBuf,
@@ -271,6 +300,36 @@ pub(crate) struct App {
 }
 
 impl App {
+    /// Sets a transient status message, timed to revert to
+    /// `default_status` once `STATUS_MESSAGE_TIMEOUT` elapses (see the
+    /// main loop's poll timeout in `run`, which is what actually notices
+    /// the expiry and performs the revert).
+    fn set_status(&mut self, message: impl Into<String>) {
+        self.status = message.into();
+        self.status_message_at = Some(Instant::now());
+    }
+
+    /// Reverts `status` to `default_status` if a transient message has
+    /// been showing for at least `STATUS_MESSAGE_TIMEOUT`. Called from
+    /// the main loop on every idle poll tick, not just after an event --
+    /// otherwise a message set right before the user stops pressing keys
+    /// would stick until the next keypress instead of timing out on its
+    /// own.
+    fn expire_status(&mut self) {
+        if self.status_message_at.is_some_and(|at| at.elapsed() >= STATUS_MESSAGE_TIMEOUT) {
+            self.status = self.default_status.clone();
+            self.status_message_at = None;
+        }
+    }
+
+    /// Whether `status` is currently the resting help line rather than a
+    /// transient message -- `ui::draw_status` uses this to decide between
+    /// `ui`'s colored key/action rendering (only valid for the help
+    /// line's own shape) and plain text for a free-form message.
+    pub(super) fn status_is_default(&self) -> bool {
+        self.status == self.default_status
+    }
+
     pub(crate) fn assigned_counts(&self) -> (usize, usize) {
         (self.parts.iter().filter(|p| p.material.is_some()).count(), self.parts.len())
     }
@@ -299,7 +358,7 @@ impl App {
 
     fn open_picker(&mut self) {
         let Some(i) = self.selected_part_index() else {
-            self.status = "select a part first".to_string();
+            self.set_status("select a part first");
             return;
         };
         let part = &self.parts[i];
@@ -338,18 +397,18 @@ impl App {
         self.parts[picker.part_index].material = if choice == 0 { None } else { Some(chosen) };
         self.resolve_part_dims(picker.part_index);
         self.dirty = true;
-        self.status = format!("set material for {}", self.parts[picker.part_index].path);
+        self.set_status(format!("set material for {}", self.parts[picker.part_index].path));
     }
 
     fn toggle_swap(&mut self) {
         let Some(i) = self.selected_part_index() else {
-            self.status = "select a part first".to_string();
+            self.set_status("select a part first");
             return;
         };
         self.parts[i].swapped = !self.parts[i].swapped;
         self.resolve_part_dims(i);
         self.dirty = true;
-        self.status = format!("swapped length/width for {}", self.parts[i].path);
+        self.set_status(format!("swapped length/width for {}", self.parts[i].path));
     }
 
     fn save(&mut self) {
@@ -364,9 +423,10 @@ impl App {
         match assignments::save(&map, &self.sidecar_path) {
             Ok(()) => {
                 self.dirty = false;
-                self.status = format!("saved {}", self.sidecar_path.display());
+                let msg = format!("saved {}", self.sidecar_path.display());
+                self.set_status(msg);
             }
-            Err(e) => self.status = format!("save failed: {e}"),
+            Err(e) => self.set_status(format!("save failed: {e}")),
         }
     }
 
@@ -422,7 +482,7 @@ impl App {
                 self.trim_allowance_in = trim_allowance_in;
                 self.print();
             }
-            _ => self.status = "kerf and trim allowance must both be numbers, in inches".to_string(),
+            _ => self.set_status("kerf and trim allowance must both be numbers, in inches"),
         }
     }
 
@@ -435,13 +495,14 @@ impl App {
         let pdf_bytes = storystick_core::diagrams::render_pdf(&layout, &bom, trim_allowance_mm);
         match std::fs::write(&self.out_pdf_path, pdf_bytes) {
             Ok(()) => {
-                self.status = if unplaced == 0 {
+                let msg = if unplaced == 0 {
                     format!("printed {} ({} sheets)", self.out_pdf_path.display(), layout.sheets.len())
                 } else {
                     format!("printed {} ({} sheets, {} part(s) unplaced)", self.out_pdf_path.display(), layout.sheets.len(), unplaced)
                 };
+                self.set_status(msg);
             }
-            Err(e) => self.status = format!("failed to write {}: {e}", self.out_pdf_path.display()),
+            Err(e) => self.set_status(format!("failed to write {}: {e}", self.out_pdf_path.display())),
         }
     }
 }
@@ -457,7 +518,7 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
 
     let tree_state = TreeState::default();
 
-    let total = parts.len();
+    let help_text = ui::tree_help_text();
     let mut app = App {
         parts,
         selection_index: HashMap::new(),
@@ -465,9 +526,12 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
         stock: stock_list,
         tree_state,
         dirty: false,
-        status: format!("{total} part(s) -- j/k move, h/l fold, e/c expand/collapse all, Enter/m assign, g swap L/W, Ctrl-d/u page, s save, p print, q quit"),
+        status: help_text.clone(),
+        default_status: help_text,
+        status_message_at: None,
         picker: None,
         print_settings: None,
+        confirm_quit: false,
         step_path: step_path.to_path_buf(),
         sidecar_path,
         out_pdf_path: out_pdf.to_path_buf(),
@@ -490,10 +554,19 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
                 app.tree_state.select_first();
                 continue;
             }
+
+            // Poll rather than block: a transient status message needs to
+            // revert to the help text on its own timeout even if the user
+            // isn't pressing anything at all.
+            if !event::poll(STATUS_POLL_INTERVAL)? {
+                app.expire_status();
+                continue;
+            }
             let Event::Key(key) = event::read()? else { continue };
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            app.expire_status();
 
             if app.picker.is_some() {
                 match key.code {
@@ -531,9 +604,40 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
                 continue;
             }
 
+            if app.confirm_quit {
+                match key.code {
+                    // Enter with no letter typed defaults to the capital
+                    // option in "[Y/n]" -- saving is the safer default
+                    // when the only cost of guessing wrong is one extra
+                    // keypress next launch, versus silently losing a
+                    // swap or material pick if `n` were the default.
+                    KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                        app.save();
+                        if app.dirty {
+                            // Save failed -- stay open so the error
+                            // status is visible instead of exiting over
+                            // it unnoticed.
+                            app.confirm_quit = false;
+                        } else {
+                            break Ok(());
+                        }
+                    }
+                    KeyCode::Char('n' | 'N') => break Ok(()),
+                    KeyCode::Esc => app.confirm_quit = false,
+                    _ => {}
+                }
+                continue;
+            }
+
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    if app.dirty {
+                        app.confirm_quit = true;
+                    } else {
+                        break Ok(());
+                    }
+                }
                 KeyCode::Char('d') if ctrl => {
                     let n = (app.last_tree_height / 2).max(1) as usize;
                     app.tree_state.scroll_down(n);
