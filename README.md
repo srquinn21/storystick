@@ -34,8 +34,10 @@ cp scripts/stock.example.yaml ~/.config/storystick/stock.yaml
 materials:
   - name: "Baltic Birch 3/4 (finished 2 sides)"
     thickness_in: 0.75
+    match: ["[Panel]"]
   - name: "Sande Ply 3/4 (utility, unseen parts)"
     thickness_in: 0.75
+    match: ["[Backer]"]
 
 sheets:
   - material: "Baltic Birch 3/4 (finished 2 sides)"
@@ -49,6 +51,13 @@ sheets:
 Two materials can share a thickness -- that's what lets you keep hidden
 parts (stretchers, nailers) off the good plywood by assigning them to the
 cheaper material by name while reviewing.
+
+`match:` (optional, per material) lists the Shapr3D `[Bracket]` tokens
+that should seed this material as a part's initial guess on load -- a
+starting point only, applied when it's thickness-compatible with the
+part; the review TUI's flag/correct workflow still catches anything it
+missed or got wrong, and an unreviewed guess is never written to the
+sidecar, so it stays free to change if the catalog does.
 
 This catalog is meant to be stable across projects (a shop's materials
 don't change per model), so it lives at a fixed location instead of being
@@ -78,7 +87,10 @@ a part you've only assigned a material to (the common case) is just one
   material: Baltic Birch 3/4 (finished 2 sides)
 ```
 
-A swapped part adds a `swapped: true` line.
+A swapped part adds a `swapped: true` line. A part you've explicitly
+cleared back to "no material" (rather than never having reviewed it at
+all) is saved as `material: null` -- this is what keeps bracket-token
+autofill (above) from re-suggesting a guess you already rejected.
 
 Rows needing attention are flagged (`!`), and a folder shows how many
 flagged parts it contains before you even expand it. A part is flagged
@@ -98,6 +110,9 @@ Keys:
 - `e` / `c` -- expand / collapse every folder
 - `Enter` -- expand/collapse a folder, or open the material picker on a part
 - `m` -- open the material picker on the selected part directly
+- `b` -- bulk-edit: pick a bracket tag (e.g. `[Panel]`), see a summary of
+  how many parts carry it and what they're currently set to, then apply
+  one material choice to all of them at once
 - `g` -- swap the selected part's length and width
 - `Ctrl-d` / `Ctrl-u` -- half-page down/up
 - `s` -- save material assignments to the sidecar
@@ -128,10 +143,16 @@ between the two fields, type to edit, `Enter` prints, `Esc` cancels. It
 starts pre-filled with the current session's values (`--kerf-in`/
 `--trim-allowance-in` at launch, or whatever you last printed with).
 
-Printing writes the bill of materials to the console and a PDF: a BOM
-page, one page per sheet (every cut labeled with its own dimensions,
-ready to mark up at the bench), and a Parts Index mapping each on-page
-code back to its full CAD path.
+Printing generates a PDF, organized
+for shop assembly one construction stage at a time rather than as one
+flat document: a whole-project Bill of Materials first, then per
+construction-stage section (Carcasses, Doors, Face Frames, Drawers --
+read off folder-naming keywords, in build order) a front page (section
+title, that section's own BOM, and a blank ruled Notes area, since these
+plans travel on a clipboard), that section's own cut-sheet pages (every
+cut labeled with its own dimensions, ready to mark up at the bench), and
+that section's own Parts Index mapping each on-page code back to its
+full CAD path.
 
 Options:
 
