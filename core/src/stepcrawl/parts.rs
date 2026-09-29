@@ -159,33 +159,39 @@ pub fn off_grid_default(part: &PartGroup) -> OffGrid {
     off_grid(part, DEFAULT_GRID_IN, DEFAULT_OFF_GRID_TOLERANCE_IN)
 }
 
-/// Relabel `part`'s dimensions given a known material thickness (e.g.
-/// from an explicit material assignment): whichever of its three measured
-/// dimensions is closest to `thickness_mm` becomes thickness, and the
-/// other two are sorted into length/width. Corrects the default
-/// largest/middle/smallest guess for a piece ripped narrower than it is
-/// thick. Returns Err if no dimension is within tolerance_mm.
-pub fn with_known_thickness(part: &PartGroup, thickness_mm: f64, tolerance_mm: f64) -> Result<PartGroup, String> {
-    let dims = [part.length_mm, part.width_mm, part.thickness_mm];
+/// Given three measured dimensions and a known material thickness (e.g.
+/// from an explicit material assignment), returns them relabeled as
+/// (length_mm, width_mm, thickness_mm): whichever is closest to
+/// `thickness_mm` becomes thickness, and the other two are sorted into
+/// length/width. Corrects the default largest/middle/smallest guess for a
+/// piece ripped narrower than it is thick. Returns Err if no dimension is
+/// within `tolerance_mm` -- a real signal, not just a missed correction:
+/// it means the assigned material doesn't actually match this part's
+/// geometry at all.
+pub fn relabel_with_known_thickness(dims_mm: (f64, f64, f64), thickness_mm: f64, tolerance_mm: f64) -> Result<(f64, f64, f64), String> {
+    let dims = [dims_mm.0, dims_mm.1, dims_mm.2];
     let idx = (0..3usize)
         .min_by(|&a, &b| (dims[a] - thickness_mm).abs().partial_cmp(&(dims[b] - thickness_mm).abs()).unwrap())
         .unwrap();
     if (dims[idx] - thickness_mm).abs() > tolerance_mm {
         return Err(format!(
-            "no dimension of this {} part ({:.2} / {:.2} / {:.2} mm) is within {} mm of known thickness {} mm",
-            part.top_folder, part.length_mm, part.width_mm, part.thickness_mm, tolerance_mm, thickness_mm
+            "no dimension ({:.2} / {:.2} / {:.2} mm) is within {tolerance_mm} mm of known thickness {thickness_mm} mm",
+            dims[0], dims[1], dims[2]
         ));
     }
     let thickness = dims[idx];
     let mut remaining: Vec<f64> = (0..3).filter(|&i| i != idx).map(|i| dims[i]).collect();
     remaining.sort_by(|a, b| b.partial_cmp(a).unwrap());
-    Ok(PartGroup {
-        top_folder: part.top_folder.clone(),
-        length_mm: remaining[0],
-        width_mm: remaining[1],
-        thickness_mm: thickness,
-        instances: part.instances.clone(),
-    })
+    Ok((remaining[0], remaining[1], thickness))
+}
+
+/// Relabel `part`'s dimensions given a known material thickness -- see
+/// `relabel_with_known_thickness`.
+pub fn with_known_thickness(part: &PartGroup, thickness_mm: f64, tolerance_mm: f64) -> Result<PartGroup, String> {
+    let (length_mm, width_mm, thickness_mm) =
+        relabel_with_known_thickness((part.length_mm, part.width_mm, part.thickness_mm), thickness_mm, tolerance_mm)
+            .map_err(|e| format!("{} part: {e}", part.top_folder))?;
+    Ok(PartGroup { top_folder: part.top_folder.clone(), length_mm, width_mm, thickness_mm, instances: part.instances.clone() })
 }
 
 pub fn with_known_thickness_default(part: &PartGroup, thickness_mm: f64) -> Result<PartGroup, String> {

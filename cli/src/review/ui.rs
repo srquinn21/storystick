@@ -1,4 +1,4 @@
-use super::{tree, App};
+use super::{tree, App, PrintField};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -16,6 +16,9 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     if app.picker.is_some() {
         draw_picker(frame, area, app);
     }
+    if app.print_settings.is_some() {
+        draw_print_settings(frame, area, app);
+    }
 }
 
 fn draw_tree(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -28,17 +31,25 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &mut App) {
         if app.dirty { " [modified]" } else { "" },
     );
 
+    // The tree widget has no header row of its own, so the outer block is
+    // rendered here directly (not via `Tree::block`) to make room for a
+    // fixed header line, column-aligned with each leaf row, above it.
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    frame.render_widget(Paragraph::new(tree::header_line()), rows[0]);
+
     let widget = Tree::new(&items)
         .expect("sibling names disambiguated in tree::insert")
-        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol(">> ");
+        .highlight_symbol(tree::HIGHLIGHT_SYMBOL);
 
-    // Borders eat two rows; the rest is what a page-scroll (Ctrl-d/u)
-    // should actually jump by.
-    app.last_tree_height = area.height.saturating_sub(2);
+    // What a page-scroll (Ctrl-d/u) should actually jump by.
+    app.last_tree_height = rows[1].height;
 
-    frame.render_stateful_widget(widget, area, &mut app.tree_state);
+    frame.render_stateful_widget(widget, rows[1], &mut app.tree_state);
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -65,4 +76,27 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &mut App) {
 
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, &mut picker.list_state);
+}
+
+fn draw_print_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(ps) = &app.print_settings else { return };
+    let popup = centered_rect(56, 6, area);
+
+    let field_line = |label: &str, value: &str, focused: bool| {
+        let cursor = if focused { "_" } else { "" };
+        let text = format!(" {label:<22}{value}{cursor}");
+        if focused { Line::styled(text, Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD)) } else { Line::from(text) }
+    };
+
+    let lines = vec![
+        field_line("Kerf (in):", &ps.kerf_in, ps.focus == PrintField::Kerf),
+        Line::from(""),
+        field_line("Trim allowance (in):", &ps.trim_allowance_in, ps.focus == PrintField::TrimAllowance),
+    ];
+
+    let block = Block::default().borders(Borders::ALL).title(" Print -- Tab switch field, Enter print, Esc cancel ");
+    let paragraph = Paragraph::new(lines).block(block);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
 }

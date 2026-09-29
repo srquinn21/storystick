@@ -8,10 +8,20 @@
 //! the only thing that persists between runs is the assignment sidecar,
 //! keyed by path + dimensions, not bare path (see `crate::assignments`
 //! and `Part::assignment_key`).
+//!
+//! Grain always runs with a part's length. stepcrawl's own length/width
+//! guess (longer of the two in-plane dimensions is length) is often
+//! exactly what you want, but not always -- `g` swaps a part's
+//! length/width when it isn't, rather than exposing a separate "grain"
+//! concept: there was never an independent capability there to preserve
+//! (packing has only ever cared about which dimension is called length),
+//! so a second concept meaning the same thing was just something else to
+//! learn.
 
 mod tree;
 mod ui;
 
+use crate::assignments::PartOverride;
 use crate::{assignments, round4, stock, MM_PER_IN};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
@@ -19,21 +29,29 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use storystick_core::nesting::{bill_of_materials, pack, Material, PackablePart, StockSheet};
-use storystick_core::stepcrawl::extract_parts;
+use storystick_core::stepcrawl::{extract_parts, relabel_with_known_thickness};
 use tui_tree_widget::TreeState;
 
 /// How far a part's own measured thickness may sit from a candidate
 /// material's nominal thickness and still be offered in the picker (or
 /// count toward "more than one compatible material" for auto-flagging).
-/// Purely a UX filter -- once a material is actually assigned, `pack()`
-/// matches by material name, not thickness (see `PackablePart::material_name`),
-/// so this tolerance never affects what a part can nest onto.
+/// Also used, converted to mm, as `resolve_dims`'s correction tolerance --
+/// deliberately the *same* tolerance for both, not core's tighter
+/// `DEFAULT_KNOWN_THICKNESS_TOLERANCE_MM` (1mm, tuned for spotting a
+/// narrow-rip misread against otherwise-clean dimensions): a material the
+/// picker was willing to offer must never immediately flag as a mismatch
+/// the moment you pick it, and real sheet goods commonly run a bit under
+/// their nominal thickness (a lot of "3/4"" plywood is closer to 23/32"),
+/// so 0.06" of slack matters for the correction too, not just the picker.
 const COMPATIBLE_THICKNESS_TOLERANCE_IN: f64 = 0.06;
 
 pub(crate) struct Part {
     pub path: String,
     /// The sidecar's real identity key for this part: `path` plus this
-    /// part's own dimensions. Shapr3D does not actually guarantee sibling
+    /// part's own *raw* dimensions (see `raw_length_in` etc, never the
+    /// possibly-corrected/swapped `length_in` etc -- a key that shifted
+    /// under a material reassignment would orphan the very override it's
+    /// meant to persist). Shapr3D does not actually guarantee sibling
     /// body names are unique -- an un-renamed duplicate can leave two
     /// geometrically different parts sharing one `path` (seen in real
     /// project data: two "Body 03 (2)"s under the same folder with
@@ -47,15 +65,74 @@ pub(crate) struct Part {
     /// in the file, so it can't drift out from under a saved assignment
     /// that way. See `assignment_key`.
     pub assignment_key: String,
+    /// stepcrawl's raw guess (longer of the two in-plane dimensions is
+    /// length, shorter is width, third is thickness) -- immutable for the
+    /// part's lifetime, since it's the actual geometric measurement.
+    /// `length_in`/`width_in`/`thickness_in` are derived from this (see
+    /// `resolve_dims`), recomputed whenever `material` or `swapped`
+    /// changes. Keeping the raw triple fixed is what makes that
+    /// derivation reversible: re-picking a different material, or
+    /// toggling the swap back off, recovers the exact original numbers
+    /// instead of drifting through repeated corrections.
+    pub raw_length_in: f64,
+    pub raw_width_in: f64,
+    pub raw_thickness_in: f64,
     pub length_in: f64,
     pub width_in: f64,
     pub thickness_in: f64,
     pub unreliable: bool,
+    /// True when a material is assigned but none of this part's three raw
+    /// dimensions comes within tolerance of that material's thickness --
+    /// a real mismatch (wrong material picked, or this part isn't what it
+    /// looks like), not just a missed correction. See `resolve_dims`.
+    pub thickness_mismatch: bool,
     pub material: Option<String>,
+    /// Grain always runs with length (see this module's docs); this says
+    /// whether length/width, as guessed, have been swapped so the part's
+    /// other edge runs with the grain instead.
+    pub swapped: bool,
 }
 
 fn assignment_key(path: &str, length_in: f64, width_in: f64, thickness_in: f64) -> String {
     format!("{path} @ {length_in:.4}x{width_in:.4}x{thickness_in:.4}")
+}
+
+/// Derives (length_in, width_in, thickness_in, thickness_mismatch) from a
+/// part's raw (length_in, width_in, thickness_in) guess, a possibly-
+/// assigned material, and whether length/width have been manually
+/// swapped. Operates purely on the *values* in `raw`, never their
+/// current field positions, so it's safe to call repeatedly as material
+/// or swap state changes: re-deriving from the same three raw numbers
+/// each time means a cleared material or an untoggled swap recovers
+/// exactly the original guess, and a changed material re-picks thickness
+/// fresh rather than compounding onto a previous correction.
+fn resolve_dims(raw: (f64, f64, f64), material: Option<&Material>, swapped: bool) -> (f64, f64, f64, bool) {
+    let (mut length_in, mut width_in, mut thickness_in) = raw;
+    let mut thickness_mismatch = false;
+    if let Some(m) = material {
+        let raw_mm = (raw.0 * MM_PER_IN, raw.1 * MM_PER_IN, raw.2 * MM_PER_IN);
+        match relabel_with_known_thickness(raw_mm, m.thickness_mm, COMPATIBLE_THICKNESS_TOLERANCE_IN * MM_PER_IN) {
+            Ok((length_mm, width_mm, thickness_mm)) => {
+                length_in = round4(length_mm / MM_PER_IN);
+                width_in = round4(width_mm / MM_PER_IN);
+                thickness_in = round4(thickness_mm / MM_PER_IN);
+            }
+            Err(_) => thickness_mismatch = true,
+        }
+    }
+    if swapped {
+        std::mem::swap(&mut length_in, &mut width_in);
+    }
+    (length_in, width_in, thickness_in, thickness_mismatch)
+}
+
+/// Minimal-decimals text for a print-settings edit field (e.g. "0.125",
+/// not "0.1250"; "0", not "0.0") -- easier to edit than a fixed-width
+/// display value.
+fn format_editable(v: f64) -> String {
+    let s = format!("{v:.4}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() { "0".to_string() } else { s.to_string() }
 }
 
 impl Part {
@@ -83,39 +160,63 @@ fn compatible_materials<'a>(materials: &'a [Material], thickness_in: f64) -> Vec
 
 /// A part is flagged when its geometry was ambiguous (`unreliable`, set
 /// by stepcrawl when a face-normal-based dimension guess couldn't be made
-/// confidently) or when it's unassigned but more than one stock material
-/// shares its thickness -- leaving it blank would let cutlist generation
-/// route it onto whichever one it finds space on first, which is exactly
-/// the "hidden stretcher on show-face plywood" mistake a named material
-/// assignment exists to prevent.
+/// confidently), when its assigned material's thickness doesn't actually
+/// match any of its measured dimensions (`thickness_mismatch`, see
+/// `resolve_dims` -- a real problem, not a missed correction: the wrong
+/// material got picked, or this part isn't what it looks like), or when
+/// it has no material assigned at all -- even if only one stock material
+/// happens to match its thickness today. That single match is still an
+/// inference, not a decision you made: it's silently wrong the moment a
+/// second material at that thickness is added to the catalog, and until
+/// then it's easy to mistake an unreviewed part for a resolved one just
+/// because nothing highlighted it. A part missing a decision is flagged
+/// either way; the reason string only distinguishes *why* -- genuinely
+/// ambiguous (more than one stock material shares its thickness, so
+/// leaving it blank would let printing route it onto whichever one it
+/// finds space on first, the "hidden stretcher on show-face plywood"
+/// mistake a named assignment exists to prevent) versus simply not yet
+/// reviewed.
 pub(crate) fn part_flag(part: &Part, materials: &[Material]) -> Option<&'static str> {
     if part.unreliable {
         return Some("unreliable geometry");
     }
-    if part.material.is_none() && compatible_materials(materials, part.thickness_in).len() > 1 {
-        return Some("ambiguous material");
+    if part.thickness_mismatch {
+        return Some("material thickness doesn't match this part's geometry");
+    }
+    if part.material.is_none() {
+        return Some(if compatible_materials(materials, part.thickness_in).len() > 1 { "ambiguous material" } else { "no material assigned" });
     }
     None
 }
 
-fn load_parts(step_path: &Path, assignments: &BTreeMap<String, String>) -> Result<Vec<Part>, Box<dyn Error>> {
+fn load_parts(step_path: &Path, overrides: &BTreeMap<String, PartOverride>, materials: &[Material]) -> Result<Vec<Part>, Box<dyn Error>> {
     let groups = extract_parts(step_path)?;
     let mut parts = Vec::new();
     for group in &groups {
         for instance in &group.instances {
-            let length_in = round4(group.length_mm / MM_PER_IN);
-            let width_in = round4(group.width_mm / MM_PER_IN);
-            let thickness_in = round4(group.thickness_mm / MM_PER_IN);
-            let key = assignment_key(&instance.path, length_in, width_in, thickness_in);
-            let material = assignments.get(&key).cloned();
+            let raw_length_in = round4(group.length_mm / MM_PER_IN);
+            let raw_width_in = round4(group.width_mm / MM_PER_IN);
+            let raw_thickness_in = round4(group.thickness_mm / MM_PER_IN);
+            let key = assignment_key(&instance.path, raw_length_in, raw_width_in, raw_thickness_in);
+            let over = overrides.get(&key);
+            let material = over.and_then(|o| o.material.clone());
+            let swapped = over.map(|o| o.swapped).unwrap_or(false);
+            let material_ref = material.as_deref().and_then(|name| materials.iter().find(|m| m.name == name));
+            let (length_in, width_in, thickness_in, thickness_mismatch) =
+                resolve_dims((raw_length_in, raw_width_in, raw_thickness_in), material_ref, swapped);
             parts.push(Part {
                 path: instance.path.clone(),
                 assignment_key: key,
+                raw_length_in,
+                raw_width_in,
+                raw_thickness_in,
                 length_in,
                 width_in,
                 thickness_in,
                 unreliable: instance.unreliable,
+                thickness_mismatch,
                 material,
+                swapped,
             });
         }
     }
@@ -126,6 +227,24 @@ pub(crate) struct PickerState {
     pub(crate) part_index: usize,
     pub(crate) options: Vec<String>,
     pub(crate) list_state: ListState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrintField {
+    Kerf,
+    TrimAllowance,
+}
+
+pub(crate) struct PrintSettings {
+    pub(crate) kerf_in: String,
+    pub(crate) trim_allowance_in: String,
+    pub(crate) focus: PrintField,
+    /// Whether the focused field has had a keystroke since it was last
+    /// focused. The first character typed replaces the pre-filled value
+    /// instead of appending to it -- without this, typing "0.25" over a
+    /// pre-filled "0" would land on "00.25".
+    kerf_touched: bool,
+    trim_touched: bool,
 }
 
 pub(crate) struct App {
@@ -142,6 +261,7 @@ pub(crate) struct App {
     pub(crate) dirty: bool,
     pub(crate) status: String,
     pub(crate) picker: Option<PickerState>,
+    pub(crate) print_settings: Option<PrintSettings>,
     pub(crate) step_path: PathBuf,
     sidecar_path: PathBuf,
     out_pdf_path: PathBuf,
@@ -161,6 +281,12 @@ impl App {
             return None;
         }
         self.selection_index.get(&selected.join(" / ")).copied()
+    }
+
+    fn expand_all(&mut self) {
+        for path in tree::all_folder_paths(&self.parts) {
+            self.tree_state.open(path);
+        }
     }
 
     fn handle_enter(&mut self) {
@@ -189,18 +315,52 @@ impl App {
         self.picker = Some(PickerState { part_index: i, options, list_state });
     }
 
+    /// Recomputes `length_in`/`width_in`/`thickness_in`/`thickness_mismatch`
+    /// for `self.parts[i]` from its raw dims, current material, and swap
+    /// state -- call after mutating either (see `resolve_dims`).
+    fn resolve_part_dims(&mut self, i: usize) {
+        let material_name = self.parts[i].material.clone();
+        let material = material_name.as_deref().and_then(|name| self.materials.iter().find(|m| m.name == name));
+        let raw = (self.parts[i].raw_length_in, self.parts[i].raw_width_in, self.parts[i].raw_thickness_in);
+        let swapped = self.parts[i].swapped;
+        let (length_in, width_in, thickness_in, thickness_mismatch) = resolve_dims(raw, material, swapped);
+        let part = &mut self.parts[i];
+        part.length_in = length_in;
+        part.width_in = width_in;
+        part.thickness_in = thickness_in;
+        part.thickness_mismatch = thickness_mismatch;
+    }
+
     fn confirm_picker(&mut self) {
         let Some(picker) = self.picker.take() else { return };
         let Some(choice) = picker.list_state.selected() else { return };
         let chosen = picker.options[choice].clone();
         self.parts[picker.part_index].material = if choice == 0 { None } else { Some(chosen) };
+        self.resolve_part_dims(picker.part_index);
         self.dirty = true;
         self.status = format!("set material for {}", self.parts[picker.part_index].path);
     }
 
+    fn toggle_swap(&mut self) {
+        let Some(i) = self.selected_part_index() else {
+            self.status = "select a part first".to_string();
+            return;
+        };
+        self.parts[i].swapped = !self.parts[i].swapped;
+        self.resolve_part_dims(i);
+        self.dirty = true;
+        self.status = format!("swapped length/width for {}", self.parts[i].path);
+    }
+
     fn save(&mut self) {
-        let map: BTreeMap<String, String> =
-            self.parts.iter().filter_map(|p| p.material.clone().map(|m| (p.assignment_key.clone(), m))).collect();
+        let map: BTreeMap<String, PartOverride> = self
+            .parts
+            .iter()
+            .filter_map(|p| {
+                let over = PartOverride { material: p.material.clone(), swapped: p.swapped };
+                if over.is_empty() { None } else { Some((p.assignment_key.clone(), over)) }
+            })
+            .collect();
         match assignments::save(&map, &self.sidecar_path) {
             Ok(()) => {
                 self.dirty = false;
@@ -210,7 +370,63 @@ impl App {
         }
     }
 
-    fn generate_cutlist(&mut self) {
+    fn open_print_settings(&mut self) {
+        self.print_settings = Some(PrintSettings {
+            kerf_in: format_editable(self.kerf_in),
+            trim_allowance_in: format_editable(self.trim_allowance_in),
+            focus: PrintField::Kerf,
+            kerf_touched: false,
+            trim_touched: false,
+        });
+    }
+
+    fn print_settings_field(ps: &mut PrintSettings) -> (&mut String, &mut bool) {
+        match ps.focus {
+            PrintField::Kerf => (&mut ps.kerf_in, &mut ps.kerf_touched),
+            PrintField::TrimAllowance => (&mut ps.trim_allowance_in, &mut ps.trim_touched),
+        }
+    }
+
+    fn print_settings_input(&mut self, c: char) {
+        let Some(ps) = &mut self.print_settings else { return };
+        let (field, touched) = Self::print_settings_field(ps);
+        if !*touched {
+            field.clear();
+            *touched = true;
+        }
+        if c.is_ascii_digit() || (c == '.' && !field.contains('.')) {
+            field.push(c);
+        }
+    }
+
+    fn print_settings_backspace(&mut self) {
+        let Some(ps) = &mut self.print_settings else { return };
+        let (field, touched) = Self::print_settings_field(ps);
+        *touched = true;
+        field.pop();
+    }
+
+    fn print_settings_toggle_focus(&mut self) {
+        let Some(ps) = &mut self.print_settings else { return };
+        ps.focus = match ps.focus {
+            PrintField::Kerf => PrintField::TrimAllowance,
+            PrintField::TrimAllowance => PrintField::Kerf,
+        };
+    }
+
+    fn confirm_print_settings(&mut self) {
+        let Some(ps) = self.print_settings.take() else { return };
+        match (ps.kerf_in.parse::<f64>(), ps.trim_allowance_in.parse::<f64>()) {
+            (Ok(kerf_in), Ok(trim_allowance_in)) => {
+                self.kerf_in = kerf_in;
+                self.trim_allowance_in = trim_allowance_in;
+                self.print();
+            }
+            _ => self.status = "kerf and trim allowance must both be numbers, in inches".to_string(),
+        }
+    }
+
+    fn print(&mut self) {
         let parts: Vec<PackablePart> = self.parts.iter().map(Part::to_packable).collect();
         let trim_allowance_mm = self.trim_allowance_in * MM_PER_IN;
         let layout = pack(&parts, &self.stock, self.kerf_in * MM_PER_IN, trim_allowance_mm);
@@ -220,9 +436,9 @@ impl App {
         match std::fs::write(&self.out_pdf_path, pdf_bytes) {
             Ok(()) => {
                 self.status = if unplaced == 0 {
-                    format!("wrote {} ({} sheets)", self.out_pdf_path.display(), layout.sheets.len())
+                    format!("printed {} ({} sheets)", self.out_pdf_path.display(), layout.sheets.len())
                 } else {
-                    format!("wrote {} ({} sheets, {} part(s) unplaced)", self.out_pdf_path.display(), layout.sheets.len(), unplaced)
+                    format!("printed {} ({} sheets, {} part(s) unplaced)", self.out_pdf_path.display(), layout.sheets.len(), unplaced)
                 };
             }
             Err(e) => self.status = format!("failed to write {}: {e}", self.out_pdf_path.display()),
@@ -233,10 +449,11 @@ impl App {
 pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: f64, trim_allowance_in: f64) -> Result<(), Box<dyn Error>> {
     let sidecar_path = assignments::sidecar_path(step_path);
     let existing_assignments = assignments::load(&sidecar_path)?;
-    let parts = load_parts(step_path, &existing_assignments)?;
 
     let stock_list = stock::read(stock_path)?;
     let materials = distinct_materials(&stock_list);
+
+    let parts = load_parts(step_path, &existing_assignments, &materials)?;
 
     let tree_state = TreeState::default();
 
@@ -248,8 +465,9 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
         stock: stock_list,
         tree_state,
         dirty: false,
-        status: format!("{total} part(s) -- j/k move, h/l fold, Enter/m assign, Ctrl-d/u page, s save, c cutlist, q quit"),
+        status: format!("{total} part(s) -- j/k move, h/l fold, e/c expand/collapse all, Enter/m assign, g swap L/W, Ctrl-d/u page, s save, p print, q quit"),
         picker: None,
+        print_settings: None,
         step_path: step_path.to_path_buf(),
         sidecar_path,
         out_pdf_path: out_pdf.to_path_buf(),
@@ -301,6 +519,18 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
                 continue;
             }
 
+            if app.print_settings.is_some() {
+                match key.code {
+                    KeyCode::Esc => app.print_settings = None,
+                    KeyCode::Enter => app.confirm_print_settings(),
+                    KeyCode::Tab | KeyCode::Up | KeyCode::Down => app.print_settings_toggle_focus(),
+                    KeyCode::Char(c) => app.print_settings_input(c),
+                    KeyCode::Backspace => app.print_settings_backspace(),
+                    _ => {}
+                }
+                continue;
+            }
+
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
@@ -324,10 +554,15 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
                 KeyCode::Right | KeyCode::Char('l') => {
                     app.tree_state.key_right();
                 }
+                KeyCode::Char('e') => app.expand_all(),
+                KeyCode::Char('c') => {
+                    app.tree_state.close_all();
+                }
                 KeyCode::Enter => app.handle_enter(),
                 KeyCode::Char('m') => app.open_picker(),
+                KeyCode::Char('g') => app.toggle_swap(),
                 KeyCode::Char('s') => app.save(),
-                KeyCode::Char('c') => app.generate_cutlist(),
+                KeyCode::Char('p') => app.open_print_settings(),
                 _ => {}
             }
         }
@@ -346,11 +581,16 @@ mod tests {
         Part {
             path: "Bench / Body".to_string(),
             assignment_key: assignment_key("Bench / Body", 30.0, 20.0, thickness_in),
+            raw_length_in: 30.0,
+            raw_width_in: 20.0,
+            raw_thickness_in: thickness_in,
             length_in: 30.0,
             width_in: 20.0,
             thickness_in,
             unreliable,
+            thickness_mismatch: false,
             material: material.map(str::to_string),
+            swapped: false,
         }
     }
 
@@ -369,10 +609,14 @@ mod tests {
     }
 
     #[test]
-    fn unassigned_part_is_not_flagged_when_only_one_material_matches() {
+    fn unassigned_part_is_still_flagged_when_only_one_material_matches() {
+        // A single match today is still an inference, not a decision --
+        // and silently wrong the moment a second material at that
+        // thickness joins the catalog. An unreviewed part must never look
+        // the same as a resolved one.
         let materials = vec![material("Baltic Birch 3/4", 0.75), material("Baltic Birch 1/4", 0.25)];
         let unassigned = part(0.75, None, false);
-        assert_eq!(part_flag(&unassigned, &materials), None);
+        assert_eq!(part_flag(&unassigned, &materials), Some("no material assigned"));
     }
 
     #[test]
@@ -380,6 +624,53 @@ mod tests {
         let materials = vec![material("Baltic Birch 3/4", 0.75), material("Sande Ply 3/4", 0.75)];
         let pinned = part(0.75, Some("Sande Ply 3/4"), false);
         assert_eq!(part_flag(&pinned, &materials), None);
+    }
+
+    #[test]
+    fn thickness_mismatch_is_flagged_even_though_a_material_is_assigned() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let mut mismatched = part(0.75, Some("Baltic Birch 3/4"), false);
+        mismatched.thickness_mismatch = true;
+        assert_eq!(part_flag(&mismatched, &materials), Some("material thickness doesn't match this part's geometry"));
+    }
+
+    #[test]
+    fn resolve_dims_leaves_the_raw_guess_alone_with_no_material() {
+        let (length_in, width_in, thickness_in, mismatch) = resolve_dims((30.0, 20.0, 0.75), None, false);
+        assert_eq!((length_in, width_in, thickness_in), (30.0, 20.0, 0.75));
+        assert!(!mismatch);
+    }
+
+    #[test]
+    fn resolve_dims_corrects_a_narrow_rip_once_the_material_is_known() {
+        // Ripped from 3/4" stock to a strip narrower than it is thick:
+        // the raw largest/middle/smallest guess mislabels the 0.25" width
+        // as thickness. Knowing the assigned material is really 3/4"
+        // fixes it.
+        let bb34 = Material { name: "Baltic Birch 3/4".to_string(), thickness_mm: 0.75 * MM_PER_IN };
+        let (length_in, width_in, thickness_in, mismatch) = resolve_dims((24.0, 0.75, 0.25), Some(&bb34), false);
+        assert_eq!((length_in, width_in, thickness_in), (24.0, 0.25, 0.75));
+        assert!(!mismatch);
+    }
+
+    #[test]
+    fn resolve_dims_flags_a_mismatch_instead_of_guessing() {
+        let unrelated = Material { name: "1/8\" hardboard".to_string(), thickness_mm: 0.125 * MM_PER_IN };
+        let (length_in, width_in, thickness_in, mismatch) = resolve_dims((30.0, 20.0, 0.75), Some(&unrelated), false);
+        // No dimension is anywhere near 0.125" -- dims fall back to the
+        // raw guess rather than silently picking the closest anyway.
+        assert_eq!((length_in, width_in, thickness_in), (30.0, 20.0, 0.75));
+        assert!(mismatch);
+    }
+
+    #[test]
+    fn resolve_dims_applies_the_swap_after_any_material_correction() {
+        let bb34 = Material { name: "Baltic Birch 3/4".to_string(), thickness_mm: 0.75 * MM_PER_IN };
+        let (length_in, width_in, thickness_in, mismatch) = resolve_dims((24.0, 0.75, 0.25), Some(&bb34), true);
+        // Same correction as above (thickness -> 0.75, remaining sorted
+        // 24/0.25), then length_in/width_in end up swapped on top.
+        assert_eq!((length_in, width_in, thickness_in), (0.25, 24.0, 0.75));
+        assert!(!mismatch);
     }
 
     #[test]
@@ -394,6 +685,13 @@ mod tests {
         let distinct = distinct_materials(&stock);
         let names: Vec<&str> = distinct.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, vec!["Baltic Birch 3/4", "Sande Ply 3/4"]);
+    }
+
+    #[test]
+    fn format_editable_trims_trailing_zeros_and_a_bare_zero_stays_zero() {
+        assert_eq!(format_editable(0.125), "0.125");
+        assert_eq!(format_editable(0.0), "0");
+        assert_eq!(format_editable(1.0), "1");
     }
 
     #[test]

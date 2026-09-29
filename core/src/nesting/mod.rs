@@ -38,7 +38,10 @@
 //!     per-part exception. Grain runs along a stock sheet's length_mm by
 //!     convention, and identical parts land in a consistent orientation
 //!     for repeatable fence cuts -- both satisfied for free by simply
-//!     never rotating, no per-part annotation needed.
+//!     never rotating. Deciding which of a part's two in-plane
+//!     dimensions should be called length_mm (and therefore run with the
+//!     grain) is the caller's job, made once before a `PackablePart` is
+//!     even built -- not something this module has an opinion on.
 //!   - Bucketed by (material name or thickness, then stock size): each
 //!     candidate StockSheet size within a bucket is tried largest-first,
 //!     with whatever doesn't fit carried over to the next candidate. For
@@ -83,6 +86,12 @@ impl Hash for Material {
 /// One part to be nested. `qty` copies are nested independently (each
 /// gets its own placement), not as one rectangle labeled "x3" -- `pack`
 /// doesn't assume they end up anywhere near each other.
+///
+/// length_mm is always the dimension that runs with the stock sheet's
+/// grain (grain runs along a sheet's length_mm by convention -- see this
+/// module's docs); a caller that wants a part's *other* dimension running
+/// with the grain instead swaps length_mm/width_mm before constructing
+/// this, since `pack` itself never rotates a part.
 ///
 /// `material_name = None` (the default) means "any material at this
 /// part's own thickness_mm is fine" -- `pack` matches purely by
@@ -261,9 +270,23 @@ fn split_free_rect(free_rects: &mut Vec<FreeRect>, index: usize, length: f64, wi
 /// Pack `pieces` onto as many copies of `candidate` as needed. Parts are
 /// tried width-descending (classic strip/FFDH heuristic: the widest parts
 /// define strip heights first, narrower parts fill in behind them). For
-/// each part: best-fit into any open strip's free space; else open a new
-/// strip on any open sheet with enough remaining width; else open a new
-/// sheet.
+/// each part: best-fit into whatever open strip has the tightest-fitting
+/// free space -- any height, no matter how much taller than the part
+/// itself, so long as it's tall enough -- else open a new strip on any
+/// open sheet with enough remaining width, else open a new sheet.
+///
+/// Deliberately no preference for keeping same-size parts in one strip
+/// over reusing a taller foreign one: ganging a part into an existing,
+/// taller strip costs nothing extra to cut (it's one rip either way,
+/// already made), while forcing it to wait for a strip of its own size
+/// risks an entire additional sheet, or stranding a smaller remainder
+/// sheet nothing else fits on -- far more expensive than a few inches of
+/// wasted rip height. A same-size group can still end up split across
+/// two strips this way when the pieces before it happened to leave
+/// room for only some of it; if that split lands on an already-open
+/// sheet (the common case -- best-fit tries every existing strip before
+/// ever opening a new sheet), it costs nothing, just two labeled
+/// rectangles instead of one contiguous block on the cut diagram.
 ///
 /// Returns the in-progress sheets touched and the ids of pieces that got
 /// placed -- the caller carries over whatever's left to the next
@@ -280,8 +303,9 @@ fn place_on_candidate(
     let mut placed_ids: Vec<usize> = Vec::new();
 
     for &(piece_id, ref part) in ordered {
-        let length = part.length_mm + allowance_mm;
-        let width = part.width_mm + allowance_mm;
+        let (part_length, part_width) = (part.length_mm, part.width_mm);
+        let length = part_length + allowance_mm;
+        let width = part_width + allowance_mm;
         if length > candidate.length_mm || width > candidate.width_mm {
             continue; // too big for this stock size at all, regardless of sheet count
         }
@@ -323,8 +347,8 @@ fn place_on_candidate(
             part_label: part.label.clone(),
             x_mm: x,
             y_mm: y,
-            length_mm: part.length_mm,
-            width_mm: part.width_mm,
+            length_mm: part_length,
+            width_mm: part_width,
             rotated: false,
         });
         placed_ids.push(piece_id);
@@ -461,6 +485,27 @@ mod tests {
     }
 
     #[test]
+    fn pack_never_rotates_a_part_to_rescue_a_fit() {
+        // As given (width_mm=1300), this doesn't fit the sheet's 1219.2mm
+        // width -- even though swapping length_mm/width_mm would fit it
+        // fine (1300 <= the sheet's 2438.4mm length, 800 <= its 1219.2mm
+        // width). `pack` must report it unplaced rather than silently
+        // rotating it to make it fit: deciding which of a part's
+        // dimensions runs with the sheet's grain is the caller's job (see
+        // `PackablePart`'s docs), never something `pack` chooses on its
+        // own.
+        let sheet = &stock()[0];
+        let rotated_would_fit = PackablePart::new("panel", 1300.0, 800.0, 19.05);
+        assert!(pack(&[rotated_would_fit], &stock(), DEFAULT_KERF_MM, 0.0).unplaced.is_empty(), "sanity: the swapped footprint does fit");
+        assert!(1300.0 > sheet.width_mm, "test assumption: as-given width alone shouldn't fit");
+
+        let as_given = PackablePart::new("panel", 800.0, 1300.0, 19.05);
+        let layout = pack(&[as_given], &stock(), DEFAULT_KERF_MM, 0.0);
+        assert_eq!(layout.unplaced.len(), 1);
+        assert!(layout.sheets.is_empty());
+    }
+
+    #[test]
     fn pack_buckets_by_thickness_not_just_size() {
         let parts = vec![
             PackablePart { qty: 2, ..PackablePart::new("panel", 765.175, 406.4, 19.05) },
@@ -587,5 +632,42 @@ mod tests {
             sheets[0].strips[0].placements.iter().map(|p| (p.part_label.as_str(), p)).collect();
         assert_eq!(by_label["medium"].y_mm, 0.0);
         assert_eq!(by_label["short"].y_mm, by_label["medium"].width_mm, "short should stack directly above medium");
+    }
+
+    #[test]
+    fn a_same_size_group_may_split_across_strips_but_never_strands_an_avoidable_sheet() {
+        // Scaled from real project data: two ~290mm-wide parts fill most
+        // of a strip on sheet 1; a third, slightly narrower part
+        // (288.75mm) can't join them, so it opens sheet 2. Three
+        // 170mm-wide parts come next -- narrow enough that some of them
+        // fit into the leftover pockets those first two strips left
+        // behind, on sheets that already exist. A same-size group
+        // splitting across strips like this costs nothing (no rip goes
+        // uncut, no sheet goes unused) and is preferable to forcing every
+        // member to wait for a dedicated strip of its own height, which
+        // can cost a whole extra sheet -- so this only asserts none of
+        // that: every part placed, and no more sheets used than pieces
+        // that can't share space at all actually require.
+        let test_stock = StockSheet { material: Material { name: "test".to_string(), thickness_mm: 19.0 }, length_mm: 960.0, width_mm: 480.0 };
+        let parts = vec![
+            (0usize, PackablePart::new("wide-a", 331.25, 290.0, 19.0)),
+            (1usize, PackablePart::new("wide-b", 331.25, 290.0, 19.0)),
+            (2usize, PackablePart::new("mid-a", 290.0, 288.75, 19.0)),
+            (3usize, PackablePart::new("mid-b", 290.0, 288.75, 19.0)),
+            (4usize, PackablePart::new("short-a", 310.0, 170.0, 19.0)),
+            (5usize, PackablePart::new("short-b", 310.0, 170.0, 19.0)),
+            (6usize, PackablePart::new("short-c", 310.0, 170.0, 19.0)),
+        ];
+
+        let (sheets, placed_ids) = place_on_candidate(&parts, &test_stock, 0.0);
+
+        assert_eq!(placed_ids.len(), 7);
+        let short_placements: usize =
+            sheets.iter().flat_map(|s| &s.strips).flat_map(|strip| &strip.placements).filter(|p| p.part_label.starts_with("short-")).count();
+        assert_eq!(short_placements, 3);
+        // 2 sheets already exist (wide's and mid's) by the time the short
+        // group is placed; all three short parts fit into leftover space
+        // on those two, so no third sheet should ever open.
+        assert_eq!(sheets.len(), 2, "the short group should reuse the two sheets already open, not strand a third");
     }
 }
