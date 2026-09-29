@@ -165,7 +165,7 @@ pub struct Placement {
 
 /// One physical sheet (the `sheet_index`-th copy of `stock` used) and
 /// everything placed on it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SheetLayout {
     pub stock: StockSheet,
     pub sheet_index: usize,

@@ -48,14 +48,13 @@ pub(crate) fn default_path() -> PathBuf {
 /// material they're a sheet of). A sheet's thickness always comes from
 /// its named material, never repeated per-sheet, so two sheet sizes of
 /// the same material can't drift out of sync on thickness.
-pub(crate) fn read(path: &Path) -> Result<Vec<StockSheet>, Box<dyn Error>> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        format!(
-            "couldn't read stock catalog at {}: {e}\n(create one -- see scripts/stock.example.yaml -- or pass --stock <path>)",
-            path.display()
-        )
-    })?;
-    let doc: StockDoc = yaml_serde::from_str(&text)?;
+///
+/// Pure parsing/validation, no file I/O -- kept separate from `read` so it
+/// can be exercised directly with an in-memory string, the same way every
+/// other loader in this codebase (`assignments::load`,
+/// `stepcrawl::extract_parts`) separates the format from the disk access.
+pub(crate) fn parse(text: &str) -> Result<Vec<StockSheet>, Box<dyn Error>> {
+    let doc: StockDoc = yaml_serde::from_str(text)?;
 
     let materials: HashMap<String, Material> = doc
         .materials
@@ -71,4 +70,87 @@ pub(crate) fn read(path: &Path) -> Result<Vec<StockSheet>, Box<dyn Error>> {
         stock.push(StockSheet { material: material.clone(), length_mm: entry.length_in * MM_PER_IN, width_mm: entry.width_in * MM_PER_IN });
     }
     Ok(stock)
+}
+
+pub(crate) fn read(path: &Path) -> Result<Vec<StockSheet>, Box<dyn Error>> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        format!(
+            "couldn't read stock catalog at {}: {e}\n(create one -- see scripts/stock.example.yaml -- or pass --stock <path>)",
+            path.display()
+        )
+    })?;
+    parse(&text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_reads_materials_and_sheets() {
+        let yaml = r#"
+materials:
+  - name: "Baltic Birch 3/4 (finished 2 sides)"
+    thickness_in: 0.75
+  - name: "Baltic Birch 1/4"
+    thickness_in: 0.25
+
+sheets:
+  - material: "Baltic Birch 3/4 (finished 2 sides)"
+    length_in: 96
+    width_in: 48
+  - material: "Baltic Birch 1/4"
+    length_in: 96
+    width_in: 48
+"#;
+        let stock = parse(yaml).unwrap();
+
+        assert_eq!(stock.len(), 2);
+        assert_eq!(stock[0].material.name, "Baltic Birch 3/4 (finished 2 sides)");
+        assert!((stock[0].material.thickness_mm - 0.75 * MM_PER_IN).abs() < 1e-9);
+        assert!((stock[0].length_mm - 96.0 * MM_PER_IN).abs() < 1e-9);
+        assert!((stock[0].width_mm - 48.0 * MM_PER_IN).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_a_sheet_thickness_always_comes_from_its_material() {
+        // Two sheet sizes of the same material must report the exact same
+        // thickness -- there's no per-sheet thickness field to drift.
+        let yaml = r#"
+materials:
+  - name: "Baltic Birch 3/4"
+    thickness_in: 0.75
+
+sheets:
+  - material: "Baltic Birch 3/4"
+    length_in: 96
+    width_in: 48
+  - material: "Baltic Birch 3/4"
+    length_in: 60
+    width_in: 30
+"#;
+        let stock = parse(yaml).unwrap();
+        assert_eq!(stock[0].material.thickness_mm, stock[1].material.thickness_mm);
+    }
+
+    #[test]
+    fn parse_errs_when_a_sheet_references_an_unknown_material() {
+        let yaml = r#"
+materials:
+  - name: "Baltic Birch 3/4"
+    thickness_in: 0.75
+
+sheets:
+  - material: "Sande Ply 3/4"
+    length_in: 96
+    width_in: 48
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("Sande Ply 3/4"), "error should name the unresolved material: {err}");
+    }
+
+    #[test]
+    fn parse_empty_doc_yields_empty_stock() {
+        assert!(parse("").unwrap().is_empty());
+    }
 }

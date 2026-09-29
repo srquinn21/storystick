@@ -232,3 +232,115 @@ fn folder_line(name: &str, flagged: usize) -> Line<'static> {
         Line::from(Span::styled(name.to_string(), folder_style))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn material(name: &str, thickness_in: f64) -> Material {
+        Material { name: name.to_string(), thickness_mm: thickness_in * 25.4 }
+    }
+
+    /// A part with no material assigned (so `part_flag` always flags it by
+    /// default -- see `part_flag`'s "no material assigned" case) and an
+    /// `assignment_key` that just echoes `path`, since these tests never
+    /// touch the sidecar.
+    fn part(path: &str) -> Part {
+        Part {
+            path: path.to_string(),
+            assignment_key: path.to_string(),
+            raw_length_in: 30.0,
+            raw_width_in: 20.0,
+            raw_thickness_in: 0.75,
+            length_in: 30.0,
+            width_in: 20.0,
+            thickness_in: 0.75,
+            unreliable: false,
+            thickness_mismatch: false,
+            material: None,
+            swapped: false,
+        }
+    }
+
+    #[test]
+    fn build_maps_each_leaf_identifier_to_its_part_index() {
+        let parts = vec![part("Bench / Top"), part("Bench / Leg")];
+        let (items, index) = build(&parts, &[]);
+
+        assert_eq!(items.len(), 1, "both parts share one top-level folder, Bench");
+        assert_eq!(index.len(), 2);
+        assert_eq!(index["Bench / Top"], 0);
+        assert_eq!(index["Bench / Leg"], 1);
+    }
+
+    #[test]
+    fn build_disambiguates_a_colliding_leaf_name_with_a_suffix() {
+        // Two parts sharing a bare (folder-less) name would otherwise
+        // collide on the same tree identifier -- see `insert`'s docs.
+        let parts = vec![part("Body"), part("Body")];
+        let (_items, index) = build(&parts, &[]);
+
+        assert_eq!(index.get("Body"), Some(&0));
+        assert_eq!(index.get("Body (2)"), Some(&1), "second collision should get a ` (2)` suffix, not silently drop");
+    }
+
+    #[test]
+    fn build_disambiguates_three_colliding_leaf_names_in_order() {
+        let parts = vec![part("Bench / Body"), part("Bench / Body"), part("Bench / Body")];
+        let (_items, index) = build(&parts, &[]);
+
+        assert_eq!(index.get("Bench / Body"), Some(&0));
+        assert_eq!(index.get("Bench / Body (2)"), Some(&1));
+        assert_eq!(index.get("Bench / Body (3)"), Some(&2));
+    }
+
+    #[test]
+    fn all_folder_paths_lists_every_folder_at_every_depth() {
+        let parts = vec![part("Bench / Carcasses / Carcass A / Body"), part("Bench / Doors / Door A / Body")];
+        let paths: HashSet<Vec<String>> = all_folder_paths(&parts).into_iter().collect();
+
+        let expected: HashSet<Vec<String>> = [
+            vec!["Bench".to_string()],
+            vec!["Bench".to_string(), "Carcasses".to_string()],
+            vec!["Bench".to_string(), "Carcasses".to_string(), "Carcass A".to_string()],
+            vec!["Bench".to_string(), "Doors".to_string()],
+            vec!["Bench".to_string(), "Doors".to_string(), "Door A".to_string()],
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(paths, expected, "leaf names (Body) must never appear as folder paths");
+    }
+
+    #[test]
+    fn all_folder_paths_is_empty_for_a_flat_tree_of_bare_leaves() {
+        let parts = vec![part("Body A"), part("Body B")];
+        assert!(all_folder_paths(&parts).is_empty());
+    }
+
+    #[test]
+    fn count_flagged_sums_leaves_recursively_across_nested_folders() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let mut parts = vec![
+            part("Bench / Carcasses / Carcass A / Flagged"),
+            part("Bench / Carcasses / Carcass A / Resolved"),
+            part("Bench / Doors / Door A / Flagged"),
+        ];
+        parts[1].material = Some("Baltic Birch 3/4".to_string());
+
+        let (order, children) = build_nodes(&parts);
+        assert_eq!(count_flagged(&order, &children, &parts, &materials), 2, "two of the three parts have no material assigned");
+    }
+
+    #[test]
+    fn count_flagged_is_zero_once_every_part_in_the_subtree_is_resolved() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let mut parts = vec![part("Bench / A"), part("Bench / B")];
+        for p in &mut parts {
+            p.material = Some("Baltic Birch 3/4".to_string());
+        }
+
+        let (order, children) = build_nodes(&parts);
+        assert_eq!(count_flagged(&order, &children, &parts, &materials), 0);
+    }
+}

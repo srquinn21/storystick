@@ -230,6 +230,45 @@ fn assign_codes(layout: &Layout) -> (HashMap<String, String>, HashMap<String, (f
     (codes, dims)
 }
 
+/// Groups `sheets` into construction-stage sections for a PDF that lists
+/// pages section by section (see docs/poc.md's "folder-name-based PDF
+/// section grouping") -- pure grouping logic only, no page layout: what a
+/// section's pages actually look like is `render_pdf`'s job once this
+/// feeds it, not this function's.
+///
+/// A sheet's section is decided by its *first* placement's part_label --
+/// the simplest deterministic rule, and the right one for the common case
+/// nesting already tends toward (parts sharing a material/thickness bucket
+/// tend to share a construction stage too). A sheet whose placements
+/// actually span two sections is a real, if rare, edge case this doesn't
+/// try to split -- worth revisiting once real full-project data shows
+/// whether it matters in practice, per docs/poc.md's own "resolved:
+/// deferred" pattern for open questions like this.
+///
+/// `classify` maps a placement's part_label (a full CAD path) to a section
+/// label -- typically `crate::tags::classify_by_keyword` against a
+/// construction-stage keyword list; `None` (including for a sheet with no
+/// placements at all) files the sheet under `unsectioned_label`. Sections
+/// come back in first-appearance order; sheets keep their original
+/// relative order within a section.
+pub fn group_sheets_by_section<'a>(
+    sheets: &'a [SheetLayout],
+    classify: impl Fn(&str) -> Option<String>,
+    unsectioned_label: &str,
+) -> Vec<(String, Vec<&'a SheetLayout>)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<&'a SheetLayout>> = HashMap::new();
+    for sheet in sheets {
+        let section = sheet.placements.first().and_then(|p| classify(&p.part_label)).unwrap_or_else(|| unsectioned_label.to_string());
+        if !groups.contains_key(&section) {
+            order.push(section.clone());
+            groups.insert(section.clone(), Vec::new());
+        }
+        groups.get_mut(&section).unwrap().push(sheet);
+    }
+    order.into_iter().map(|label| (label.clone(), groups.remove(&label).unwrap())).collect()
+}
+
 /// A titled table that starts a fresh page and paginates itself --
 /// reprinting the header row -- if `rows` runs past the bottom margin. Used
 /// for both the BOM (small, rarely paginates) and the Parts Index
@@ -545,6 +584,60 @@ mod tests {
         let metrics = Metrics::new();
         let lines = metrics.wrap("Supercalifragilisticexpialidocious", 5.0, 9.0);
         assert_eq!(lines, vec!["Supercalifragilisticexpialidocious".to_string()]);
+    }
+
+    #[test]
+    fn group_sheets_by_section_groups_in_first_appearance_order() {
+        let sheets = vec![
+            sheet_layout(vec![placement("Bench / Left Carcass / Bottom", 0.0, 0.0, 100.0, 50.0)]),
+            sheet_layout(vec![placement("Bench / Left Door / Panel", 0.0, 0.0, 100.0, 50.0)]),
+            sheet_layout(vec![placement("Bench / Right Carcass / Bottom", 0.0, 0.0, 100.0, 50.0)]),
+        ];
+        let rules = [("Carcass", "Carcasses"), ("Door", "Doors")];
+        let classify = |path: &str| crate::tags::classify_by_keyword(path, &rules);
+
+        let grouped = group_sheets_by_section(&sheets, classify, "Unsectioned");
+
+        let labels: Vec<&str> = grouped.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, vec!["Carcasses", "Doors"], "Doors first appears after Carcasses, so it sorts second");
+        assert_eq!(grouped[0].1.len(), 2, "both carcass sheets land in the Carcasses group");
+        assert_eq!(grouped[1].1.len(), 1);
+    }
+
+    #[test]
+    fn group_sheets_by_section_falls_back_to_unsectioned_label() {
+        let sheets = vec![sheet_layout(vec![placement("Bench / Face Frame / Rail", 0.0, 0.0, 100.0, 50.0)])];
+        let rules = [("Carcass", "Carcasses")];
+        let classify = |path: &str| crate::tags::classify_by_keyword(path, &rules);
+
+        let grouped = group_sheets_by_section(&sheets, classify, "Unsectioned");
+
+        assert_eq!(grouped, vec![("Unsectioned".to_string(), vec![&sheets[0]])]);
+    }
+
+    #[test]
+    fn group_sheets_by_section_falls_back_for_a_sheet_with_no_placements() {
+        let sheets = vec![sheet_layout(vec![])];
+        let grouped = group_sheets_by_section(&sheets, |_| Some("Carcasses".to_string()), "Unsectioned");
+
+        assert_eq!(grouped, vec![("Unsectioned".to_string(), vec![&sheets[0]])]);
+    }
+
+    #[test]
+    fn group_sheets_by_section_uses_only_the_first_placements_section() {
+        // A sheet mixing two sections' parts is a known, deliberately
+        // unhandled edge case -- it's filed entirely under whichever
+        // section its first placement belongs to, not split.
+        let mixed = sheet_layout(vec![
+            placement("Bench / Left Carcass / Bottom", 0.0, 0.0, 100.0, 50.0),
+            placement("Bench / Left Door / Panel", 100.0, 0.0, 100.0, 50.0),
+        ]);
+        let rules = [("Carcass", "Carcasses"), ("Door", "Doors")];
+        let classify = |path: &str| crate::tags::classify_by_keyword(path, &rules);
+
+        let grouped = group_sheets_by_section(std::slice::from_ref(&mixed), classify, "Unsectioned");
+
+        assert_eq!(grouped, vec![("Carcasses".to_string(), vec![&mixed])]);
     }
 
     #[test]
