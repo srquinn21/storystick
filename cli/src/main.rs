@@ -1,19 +1,26 @@
 //! storystick: review a Shapr3D STEP export interactively -- flag parts
-//! needing attention, assign materials from your stock catalog, and
-//! generate the printable cutlist PDF, all from one command.
+//! needing attention, assign materials, and generate the printable
+//! cutlist PDF, all from one command run inside a project directory.
 //!
-//! There's no intermediate parts.csv: geometry always comes fresh from
-//! the STEP file (see `stepcrawl`); the only state that persists between
-//! runs is the path -> material assignment sidecar (see `assignments`).
+//! There's no CLI argument naming which STEP file or project to use:
+//! running `storystick` looks for `storystick.yaml` by walking up from
+//! the current directory (see `project::discover`), the same way `git`
+//! finds `.git` -- a directory with none anywhere above it runs the
+//! creation wizard (`wizard::create`) instead of failing. Geometry always
+//! comes fresh from the STEP file (see `stepcrawl`); everything else that
+//! persists between runs lives in that one project file (see `project`).
 
 mod assignments;
 mod autofill;
+mod project;
 mod review;
 mod sections;
 mod stock;
+mod wizard;
 
 use clap::Parser;
-use std::path::PathBuf;
+use std::error::Error;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub(crate) const MM_PER_IN: f64 = 25.4;
@@ -21,39 +28,37 @@ pub(crate) const MM_PER_IN: f64 = 25.4;
 #[derive(Parser)]
 #[command(
     name = "storystick",
-    about = "Review a Shapr3D STEP export, assign materials, and generate a printable cutlist PDF."
+    about = "Review this directory's Shapr3D STEP export, assign materials, and generate a printable cutlist PDF."
 )]
 struct Cli {
-    /// path to a Shapr3D STEP export
-    step_path: PathBuf,
     /// stock sheet catalog (default: ~/.config/storystick/stock.yaml)
     #[arg(long, value_name = "PATH")]
     stock: Option<PathBuf>,
-    /// cutlist PDF output path, used when generating from within review
-    /// (default: <model>.cutlist.pdf next to the STEP file)
-    #[arg(long, value_name = "PATH")]
-    out: Option<PathBuf>,
-    /// saw kerf, inches, used when generating the cutlist (default: 1/8")
-    #[arg(long, default_value_t = 1.0 / 8.0)]
-    kerf_in: f64,
-    /// extra rough-cut margin per part, inches, used when generating the
-    /// cutlist (default: 0, i.e. off)
-    #[arg(long, default_value_t = 0.0)]
-    trim_allowance_in: f64,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let stock_path = cli.stock.unwrap_or_else(stock::default_path);
-    let out_path = cli.out.unwrap_or_else(|| cli.step_path.with_extension("cutlist.pdf"));
 
-    match review::run(&cli.step_path, &stock_path, &out_path, cli.kerf_in, cli.trim_allowance_in) {
+    match run(&stock_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn run(stock_path: &Path) -> Result<(), Box<dyn Error>> {
+    let global_stock = stock::read(stock_path)?;
+    let cwd = std::env::current_dir()?;
+
+    let (project, project_path) = match project::discover(&cwd) {
+        Some(path) => (project::load(&path)?, path),
+        None => wizard::create(&cwd, &global_stock)?,
+    };
+
+    review::run(project, project_path, global_stock)
 }
 
 /// Round to 4 decimal inches -- the resolution parts.csv used to store

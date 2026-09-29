@@ -45,23 +45,25 @@ and set aside in favor of this.
   thickness-mismatched) parts, assign material from a stock catalog,
   swap a part's length/width, adjust kerf/trim-allowance, and generate
   the cutlist PDF.
-- Bracket-token material autofill: a stock-catalog material's optional
-  `match:` list of tokens (e.g. `match: ["[Panel]"]`) seeds an initial
-  material guess for any part whose path carries that token -- a
-  starting point only, never persisted to the sidecar unless the user
-  actually reviews and decides on it (see the sidecar note below).
+- One project file (`storystick.yaml`), discovered by walking up from
+  the current directory git-style -- `storystick` needs no path argument
+  at all. A directory with none anywhere above it runs a short creation
+  wizard instead of failing (finds the `.step` file, asks which of the
+  global stock catalog's materials this project uses). The file holds
+  this project's material subset (by name only), bracket-tag rules
+  (`autofill`), kerf/trim/output settings, and per-part exceptions -- see
+  "Unified project file" below.
+- Bracket-tag material rules, project-scoped: `storystick.yaml`'s
+  `autofill` maps a tag (e.g. `[Panel]`) to a material name. A part's
+  material resolves as its own exception (if any) first, else its tag's
+  rule (if any), else unassigned -- see "Unified project file" below for
+  why this replaced the earlier stock-catalog-level `match:` idea.
 - Bulk-edit mode (`b`): lists every distinct bracket tag in the tree
   with its part count, a confirmation summary (count + current material
-  spread) before committing, then applies one material choice to every
-  part carrying that tag via the same picker used for single-part
-  assignment. Material only, never the length/width swap -- grain
-  orientation stays a per-part decision.
-- A sidecar YAML persists material/swap overrides per part, keyed by
-  path + raw dimensions, auto-discovered next to the STEP file. The
-  sidecar distinguishes "never decided" (autofill is free to keep
-  guessing) from "explicitly set to no material" (`material: null`,
-  permanent) -- without this, a rejected autofill guess would be
-  indistinguishable from an unreviewed part and just come back next run.
+  spread) before committing, then sets (or clears) that tag's rule --
+  this is the primary, almost only way a rule gets authored. Material
+  only, never the length/width swap -- grain orientation stays a
+  per-part decision.
 - Packing: a rip-first guillotine heuristic that prioritizes never
   stranding a sheet (or leaving an unusable remainder) over keeping
   same-size parts strictly grouped in adjacent strips -- confirmed on a
@@ -110,6 +112,15 @@ chunk of the model at a time) that doesn't actually require multiple
 *files*, just a tree big enough to review in chunks. See "Tree UX at
 project scale" below.
 
+This idea's shape (a `project.yaml`, discovered by directory, with a
+project-scoped stock subset and an interactive create experience) later
+came back as "Unified project file" below -- for an unrelated reason
+(consolidating what used to be three separate config surfaces into one)
+and covering exactly one STEP file per project, not the multi-file
+splitting this section rejected. The two shouldn't be conflated: this
+section's "no" is still the answer for splitting a project across
+multiple STEP exports.
+
 ### Current direction: a single full-project STEP export
 
 Export the whole CAD project as one STEP file; storystick organizes and
@@ -133,21 +144,57 @@ functions. **Implemented**: `core::diagrams::group_sheets_by_section`
 groups a `Layout`'s sheets by section, and `render_pdf` renders the PDF
 section by section (see "What's built today" above).
 
-### Bracket-token conventions (`[Panel]`, `[Backer]`, etc.)
+### Unified project file (`storystick.yaml`)
 
-Parts are already named in Shapr3D's tree with bracket tokens intended
-for material auto-fill -- e.g. `[Panel]` implying "goes on show-face
-plywood," `[Backer]` implying "goes on cheap ply." Planned: an optional
-`match:` list of tokens per stock-catalog material entry (e.g.
-`match: ["[Panel]"]`), so `load_parts` seeds an initial material guess
-whenever a token appears in a part's path -- a starting point only; the
-existing flag/correct review workflow still catches anything the token
-missed or got wrong. **Implemented** (`cli/src/autofill.rs`,
-`cli/src/stock.rs`'s `match:` field). Only accepted when the guessed
-material is actually thickness-compatible with the part, and never
-frozen into the sidecar unless the user reviews it (see the sidecar
-tri-state note above) -- an unreviewed guess is free to change the next
-time stock.yaml does.
+Originally: a global stock-catalog `match:` list per material seeded an
+autofill guess, and a per-STEP sidecar held per-part overrides
+(material/swap), with a tri-state (never-decided / explicitly-cleared /
+assigned) so a rejected guess wouldn't just come back next run. Both
+ideas got superseded once bulk-edit (below) made a *project-scoped*,
+user-authored rule the primary mechanism instead of a guess:
+
+- **`match:` moved off the global catalog and into a per-project
+  `autofill` map** (tag -> material name), since which material a tag
+  means is a per-project call ("this project's `[Panel]`s are Baltic
+  Birch"), not a shop-wide one. The global catalog (`cli/src/stock.rs`)
+  went back to just being "what you can buy" -- no tag data at all.
+- **The per-STEP sidecar folded into one project file**
+  (`cli/src/project.rs`, `storystick.yaml`), discovered by walking up
+  from the current directory (git-style) rather than passed on the
+  command line -- see `project::discover`. One file now holds this
+  project's own material subset (`materials:`, names only, resolved
+  against the global catalog -- see `Project::resolve_materials`),
+  bracket-tag rules (`autofill:`), kerf/trim/output settings, and
+  per-part exceptions (`assignments:`, unchanged in shape from the old
+  sidecar's `PartOverride`).
+- **A part's material resolves as: its own exception, if any; else its
+  tag's rule, if any; else unassigned, flagged** (`review::resolve_material`).
+  This replaces the old tri-state entirely -- there's no longer a
+  distinct "explicitly no material" state to hold in reserve on *either*
+  side. Clearing a part's exception just deletes it and re-resolves from
+  the current rule (or unassigned); clearing a tag's rule in bulk-edit
+  just deletes that rule entry. A part with no tag and no rule that gets
+  cleared stays plain unassigned and flagged -- there's no way to mark it
+  "reviewed, intentionally has no material" short of actually assigning
+  one, on the assumption that every real part in a cutlist eventually
+  needs a real material.
+- **Bulk-edit (`b`) is now the primary rule-authoring surface, not an
+  optional bulk-write convenience**: confirming a tag's material always
+  updates that tag's persistent rule (never stamps an exception onto
+  today's matching parts), so a part with the same tag added in a future
+  STEP re-export picks up the existing rule automatically -- the actual
+  goal the whole tri-state exercise was chasing in the first place,
+  achieved more directly once rules are explicit and project-scoped
+  rather than silently-reapplied per-part guesses.
+- **First run in a new project directory** (`project::discover` finds
+  nothing walking up to the filesystem root) **triggers a short creation
+  wizard** (`cli/src/wizard.rs`, plain stdin prompts, not a TUI screen):
+  find the `.step` file (or ask, if more than one), ask which of the
+  global catalog's materials this project uses, save. Bracket-tag rules
+  are deliberately *not* asked about here -- bulk-edit is where those get
+  authored, against real parts, not guessed at during setup.
+
+**Implemented.**
 
 ### Bulk-edit mode (by tag)
 
@@ -193,10 +240,12 @@ section once both of those are true.
 The "Open design thread" above is now settled design, and every part of
 it is implemented in `cli`/`core` except tree-scaling, which stays
 deferred per that section's own "resolved: deferred" -- it's now
-possible to try a real full-project export against bracket-token
-autofill, bulk-edit, and section-grouped PDF output all together, which
-is the trigger that section named for revisiting it. This document
-exists so this design survives a context reset; update it if a decision
-changes, and split a settled, load-bearing decision out into its own
-file once one exists (this repo's ADR convention, in
-`docs/decisions/`, applies to those).
+possible to try a real full-project export against bracket-tag rules,
+bulk-edit, section-grouped PDF output, and the unified `storystick.yaml`
+project file all together, which is the trigger tree-scaling's own
+section named for revisiting it. This document exists so this design
+survives a context reset; update it if a decision changes, and split a
+settled, load-bearing decision out into its own file once one exists
+(this repo's ADR convention, in `docs/decisions/`, applies to those) --
+the unified project file and its exception/rule precedence model in
+particular are probably due for one.

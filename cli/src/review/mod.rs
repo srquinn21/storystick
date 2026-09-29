@@ -1,13 +1,27 @@
-//! `storystick <model.step>`: an in-terminal tree over a STEP file's
-//! parts -- flag rows that need attention, pick a material per part from
-//! the stock catalog, save assignments back to the sidecar, and generate
-//! the cutlist PDF from the tree's current state, all without switching
-//! to another program.
+//! `storystick`: an in-terminal tree over a project's STEP export --
+//! flag rows that need attention, assign materials, save state back to
+//! `storystick.yaml`, and generate the section-grouped cutlist PDF from
+//! the tree's current state, all without switching to another program.
 //!
 //! Geometry always comes fresh from the STEP file (see `load_parts`);
-//! the only thing that persists between runs is the assignment sidecar,
-//! keyed by path + dimensions, not bare path (see `crate::assignments`
+//! everything else that persists between runs -- which materials this
+//! project uses, bracket-tag rules, kerf/trim/output settings, and
+//! per-part exceptions -- lives in one project file (see `crate::project`
 //! and `Part::assignment_key`).
+//!
+//! A part's material resolves in this order (see `resolve_material`):
+//! its own exception (`crate::project::Project::assignments`), if it has
+//! one; else whichever of its bracket tags has a rule
+//! (`crate::project::Project::autofill`); else unassigned, flagged.
+//! Bulk-edit (`b`) is the primary way a rule gets authored -- it writes
+//! *one* rule, applied fresh to every currently-matching part that has no
+//! exception of its own, and re-applied automatically to any part a
+//! future STEP revision adds with the same tag. The single-part picker
+//! (`m`) instead carves out an exception for just the selected part;
+//! clearing that exception removes it outright and re-resolves the part
+//! from whatever rule currently applies (or plain unassigned, if none
+//! does) -- there's no third "explicitly no material" state to hold in
+//! reserve, on either the exception or the rule side.
 //!
 //! Grain always runs with a part's length. stepcrawl's own length/width
 //! guess (longer of the two in-plane dimensions is length) is often
@@ -22,10 +36,11 @@ mod tree;
 mod ui;
 
 use crate::assignments::PartOverride;
-use crate::{assignments, autofill, round4, stock, MM_PER_IN};
+use crate::project::Project;
+use crate::{autofill, round4, stock, MM_PER_IN};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -64,23 +79,23 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) struct Part {
     pub path: String,
-    /// The sidecar's real identity key for this part: `path` plus this
-    /// part's own *raw* dimensions (see `raw_length_in` etc, never the
-    /// possibly-corrected/swapped `length_in` etc -- a key that shifted
-    /// under a material reassignment would orphan the very override it's
-    /// meant to persist). Shapr3D does not actually guarantee sibling
-    /// body names are unique -- an un-renamed duplicate can leave two
-    /// geometrically different parts sharing one `path` (seen in real
-    /// project data: two "Body 03 (2)"s under the same folder with
-    /// different dimensions) -- so dimensions are always part of the key,
-    /// not just when today's file happens to have a collision. A key that
-    /// depended on whether *other* parts currently collide would be a
-    /// moving target: a path that's unique today could gain a colliding
-    /// sibling in a future re-export, silently changing that key's shape
-    /// and orphaning an assignment saved under the old one. Keying on a
-    /// part's own (path, dimensions) alone never depends on what else is
-    /// in the file, so it can't drift out from under a saved assignment
-    /// that way. See `assignment_key`.
+    /// This project's exception-map identity for this part: `path` plus
+    /// this part's own *raw* dimensions (see `raw_length_in` etc, never
+    /// the possibly-corrected/swapped `length_in` etc -- a key that
+    /// shifted under a material reassignment would orphan the very
+    /// exception it's meant to persist). Shapr3D does not actually
+    /// guarantee sibling body names are unique -- an un-renamed duplicate
+    /// can leave two geometrically different parts sharing one `path`
+    /// (seen in real project data: two "Body 03 (2)"s under the same
+    /// folder with different dimensions) -- so dimensions are always part
+    /// of the key, not just when today's file happens to have a
+    /// collision. A key that depended on whether *other* parts currently
+    /// collide would be a moving target: a path that's unique today could
+    /// gain a colliding sibling in a future re-export, silently changing
+    /// that key's shape and orphaning an exception saved under the old
+    /// one. Keying on a part's own (path, dimensions) alone never depends
+    /// on what else is in the file, so it can't drift out from under a
+    /// saved exception that way. See `assignment_key`.
     pub assignment_key: String,
     /// stepcrawl's raw guess (longer of the two in-plane dimensions is
     /// length, shorter is width, third is thickness) -- immutable for the
@@ -104,15 +119,18 @@ pub(crate) struct Part {
     /// looks like), not just a missed correction. See `resolve_dims`.
     pub thickness_mismatch: bool,
     pub material: Option<String>,
-    /// Whether `material` reflects a decision the user actually made
-    /// (via the picker or bulk-edit, including deliberately clearing it
-    /// back to `None`) rather than just a bracket-token autofill guess
-    /// (see `crate::autofill`) or the plain "nothing assigned yet"
-    /// default. Mirrors `assignments::PartOverride.material`'s outer
-    /// `Option` -- see that field's docs for why the distinction exists.
-    /// `save` only persists a material override when this is true, so an
-    /// unreviewed autofill guess is never frozen into the sidecar.
-    pub material_decided: bool,
+    /// Whether `material` is this part's own exception (see
+    /// `crate::project::Project::assignments`) rather than derived fresh
+    /// from a bracket-tag rule (`crate::project::Project::autofill`) or
+    /// left unassigned -- see `resolve_material`. Only ever true
+    /// alongside `material.is_some()`: clearing a part's exception always
+    /// removes it outright and re-resolves from the current rule (or
+    /// unassigned), never leaves an exception recording "no material."
+    /// `save` only persists `material` when this is true, so a
+    /// rule-derived material is never frozen per-part -- that's exactly
+    /// what lets a newly tagged part in a future STEP revision pick up an
+    /// existing rule automatically.
+    pub is_exception: bool,
     /// Grain always runs with length (see this module's docs); this says
     /// whether length/width, as guessed, have been swapped so the part's
     /// other edge runs with the grain instead.
@@ -169,17 +187,6 @@ impl Part {
     }
 }
 
-fn distinct_materials(stock: &[StockSheet]) -> Vec<Material> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for sheet in stock {
-        if seen.insert(sheet.material.name.clone()) {
-            out.push(sheet.material.clone());
-        }
-    }
-    out
-}
-
 fn compatible_materials<'a>(materials: &'a [Material], thickness_in: f64) -> Vec<&'a Material> {
     materials.iter().filter(|m| (m.thickness_mm / MM_PER_IN - thickness_in).abs() <= COMPATIBLE_THICKNESS_TOLERANCE_IN).collect()
 }
@@ -210,7 +217,8 @@ fn distinct_tags(parts: &[Part]) -> Vec<(String, usize)> {
 /// The current material distribution among every part carrying `tag`,
 /// most-common first -- the "current material spread" a bulk-edit
 /// confirmation summary shows before a mass write, so it's never a blind
-/// overwrite of parts that might already disagree with each other.
+/// overwrite of parts that might already disagree with each other (some
+/// resolved from the existing rule, some from their own exception).
 fn material_spread(parts: &[Part], tag: &str) -> Vec<(Option<String>, usize)> {
     let mut order: Vec<Option<String>> = Vec::new();
     let mut counts: HashMap<Option<String>, usize> = HashMap::new();
@@ -228,19 +236,44 @@ fn material_spread(parts: &[Part], tag: &str) -> Vec<(Option<String>, usize)> {
     spread
 }
 
-/// Sets `material` on every part carrying `tag` (and marks it decided --
-/// see `Part::material_decided`), returning the indices actually changed
-/// so the caller can re-derive each one's dims (`resolve_part_dims`) and
-/// mark the session dirty. Unlike the single-part picker path, this never
-/// calls `resolve_part_dims` itself: a mass write's dimension-resolution
-/// is still a per-part operation, one part at a time, just triggered from
-/// a batch of indices instead of one selection.
-fn apply_bulk_material(parts: &mut [Part], tag: &str, material: Option<&str>) -> Vec<usize> {
+/// A part's material, given whether it has its own `exception` (from
+/// `Project::assignments`) and the project's current `autofill_map` --
+/// an exception always wins; otherwise, whichever of this part's own
+/// bracket tags has a configured rule; otherwise unassigned. The second
+/// return value is exactly `Part::is_exception` -- always `false` when
+/// `exception` is `None`, so a caller re-resolving a *cleared* part (by
+/// passing `None`) never has to compute it separately.
+///
+/// Deliberately no thickness-compatibility filtering on the rule branch
+/// (unlike the picker's own material list, see `compatible_materials`):
+/// a rule was authored deliberately, having seen the confirmation
+/// summary, so a future part that turns out a bad fit for it should
+/// surface via `thickness_mismatch` (a real signal worth seeing), not be
+/// silently suppressed the way an unreviewed guess would need to be.
+fn resolve_material(path: &str, exception: Option<String>, autofill_map: &std::collections::BTreeMap<String, String>) -> (Option<String>, bool) {
+    match exception {
+        Some(name) => (Some(name), true),
+        None => (autofill::guess_material(path, autofill_map), false),
+    }
+}
+
+/// Re-resolves every part that has no exception of its own against the
+/// current `autofill_map` -- called right after a bulk-edit confirm
+/// updates that map (inserting or removing one tag's rule), so every
+/// currently-matching part picks up the change immediately. A part with
+/// its own exception is never touched here: an exception always outranks
+/// whatever a rule says, including a rule that changes after the
+/// exception was set. Returns the indices actually changed so the caller
+/// can re-derive each one's dims (`App::resolve_part_dims`).
+fn apply_bulk_material(parts: &mut [Part], autofill_map: &std::collections::BTreeMap<String, String>) -> Vec<usize> {
     let mut changed = Vec::new();
     for (i, part) in parts.iter_mut().enumerate() {
-        if tags::extract_tags(&part.path).iter().any(|t| t == tag) {
-            part.material = material.map(str::to_string);
-            part.material_decided = true;
+        if part.is_exception {
+            continue;
+        }
+        let resolved = autofill::guess_material(&part.path, autofill_map);
+        if part.material != resolved {
+            part.material = resolved;
             changed.push(i);
         }
     }
@@ -278,21 +311,7 @@ pub(crate) fn part_flag(part: &Part, materials: &[Material]) -> Option<&'static 
     None
 }
 
-/// The material an override entry itself decided, distinguishing "no
-/// entry, or an entry that never touched material" (never decided --
-/// `load_parts` is free to seed an autofill guess) from an entry that
-/// records a real decision, assigned or explicitly cleared. See
-/// `PartOverride.material`'s docs.
-fn decided_material(over: Option<&PartOverride>) -> Option<Option<String>> {
-    over.and_then(|o| o.material.clone())
-}
-
-fn load_parts(
-    step_path: &Path,
-    overrides: &BTreeMap<String, PartOverride>,
-    materials: &[Material],
-    tag_materials: &HashMap<String, String>,
-) -> Result<Vec<Part>, Box<dyn Error>> {
+fn load_parts(step_path: &Path, project: &Project, materials: &[Material]) -> Result<Vec<Part>, Box<dyn Error>> {
     let groups = extract_parts(step_path)?;
     let mut parts = Vec::new();
     for group in &groups {
@@ -301,20 +320,9 @@ fn load_parts(
             let raw_width_in = round4(group.width_mm / MM_PER_IN);
             let raw_thickness_in = round4(group.thickness_mm / MM_PER_IN);
             let key = assignment_key(&instance.path, raw_length_in, raw_width_in, raw_thickness_in);
-            let over = overrides.get(&key);
-            let (material, material_decided) = match decided_material(over) {
-                Some(name) => (name, true),
-                None => {
-                    // Never decided -- seed a bracket-token guess, but
-                    // only if it's actually thickness-compatible with
-                    // this part: a guess that would immediately flag as
-                    // a mismatch is worse than no guess at all (see
-                    // `crate::autofill`'s docs).
-                    let guess = autofill::guess_material(&instance.path, tag_materials)
-                        .filter(|name| compatible_materials(materials, raw_thickness_in).iter().any(|m| &m.name == name));
-                    (guess, false)
-                }
-            };
+            let over = project.assignments.get(&key);
+            let exception = over.and_then(|o| o.material.clone());
+            let (material, is_exception) = resolve_material(&instance.path, exception, &project.autofill);
             let swapped = over.map(|o| o.swapped).unwrap_or(false);
             let material_ref = material.as_deref().and_then(|name| materials.iter().find(|m| m.name == name));
             let (length_in, width_in, thickness_in, thickness_mismatch) =
@@ -331,7 +339,7 @@ fn load_parts(
                 unreliable: instance.unreliable,
                 thickness_mismatch,
                 material,
-                material_decided,
+                is_exception,
                 swapped,
             });
         }
@@ -343,8 +351,7 @@ fn load_parts(
 /// part, or every part carrying a bulk-edit tag (see `BulkState`). Both
 /// paths end up at the same picker UI and the same `confirm_picker`,
 /// which is the whole point: bulk-edit reuses the material picker rather
-/// than growing a second one, per docs/poc.md's own framing of it as
-/// "the existing picker UI."
+/// than growing a second one.
 pub(crate) enum PickerTarget {
     Part(usize),
     Tag(String),
@@ -359,9 +366,9 @@ pub(crate) struct PickerState {
 /// Bulk-edit-by-tag's own two stages, ahead of the shared material
 /// picker: pick which tag to act on, then see a summary (how many parts,
 /// what they're currently set to) before that mass write is even offered
-/// a material to apply -- see docs/poc.md's "confirmation summary first."
-/// Choosing a material happens via `App::picker` (`PickerTarget::Tag`),
-/// not a third variant here.
+/// a material to apply. Choosing a material happens via `App::picker`
+/// (`PickerTarget::Tag`), not a third variant here -- and it's *that*
+/// step that actually writes the project's `autofill` rule.
 pub(crate) enum BulkState {
     PickTag { tags: Vec<(String, usize)>, list_state: ListState },
     ConfirmTag { tag: String, count: usize, spread: Vec<(Option<String>, usize)> },
@@ -393,7 +400,12 @@ pub(crate) struct App {
     /// differ from `Part::path` when `tree::build` had to disambiguate a
     /// same-named sibling (see `tree::insert`).
     pub(crate) selection_index: HashMap<String, usize>,
+    /// This project's own material subset, resolved against the global
+    /// catalog (see `Project::resolve_materials`) -- what the pickers
+    /// offer, never the whole shop catalog.
     pub(crate) materials: Vec<Material>,
+    /// This project's own stock subset (see `Project::resolve_stock`) --
+    /// what `pack()` is allowed to nest onto.
     stock: Vec<StockSheet>,
     pub(crate) tree_state: TreeState<String>,
     pub(crate) dirty: bool,
@@ -411,14 +423,12 @@ pub(crate) struct App {
     pub(crate) print_settings: Option<PrintSettings>,
     /// True while the "save before exiting?" popup is up -- set when `q`
     /// or `Esc` is pressed with `dirty` still true, instead of quitting
-    /// immediately, so an unsaved swap or material pick from earlier in
-    /// the session can't be lost to a reflexive quit keypress.
+    /// immediately, so an unsaved swap, exception, or rule change from
+    /// earlier in the session can't be lost to a reflexive quit keypress.
     pub(crate) confirm_quit: bool,
     pub(crate) step_path: PathBuf,
-    sidecar_path: PathBuf,
-    out_pdf_path: PathBuf,
-    kerf_in: f64,
-    trim_allowance_in: f64,
+    project: Project,
+    project_path: PathBuf,
     pub(crate) last_tree_height: u16,
 }
 
@@ -522,13 +532,13 @@ impl App {
     }
 
     /// Stage 2 -> 3: hands off to the ordinary material picker
-    /// (`PickerTarget::Tag`), which is what actually applies the mass
-    /// write once a material is chosen (see `confirm_picker`).
+    /// (`PickerTarget::Tag`), which is what actually writes the project's
+    /// `autofill` rule once a material is chosen (see `confirm_picker`).
     fn bulk_confirm_tag(&mut self) {
         let Some(BulkState::ConfirmTag { tag, .. }) = self.bulk.take() else { return };
         let mut options: Vec<String> = self.materials.iter().map(|m| m.name.clone()).collect();
         options.sort();
-        options.insert(0, "(clear -- match by thickness alone)".to_string());
+        options.insert(0, "(clear -- remove this tag's rule)".to_string());
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         self.picker = Some(PickerState { target: PickerTarget::Tag(tag), options, list_state });
@@ -556,19 +566,39 @@ impl App {
         let chosen = if choice == 0 { None } else { Some(picker.options[choice].clone()) };
         match picker.target {
             PickerTarget::Part(i) => {
-                self.parts[i].material = chosen;
-                self.parts[i].material_decided = true;
+                match chosen {
+                    Some(name) => {
+                        self.parts[i].material = Some(name);
+                        self.parts[i].is_exception = true;
+                    }
+                    None => {
+                        // Remove the exception outright -- fall back to
+                        // this part's tag rule if one applies, else plain
+                        // unassigned. Never records a standalone "no
+                        // material" exception.
+                        self.parts[i].is_exception = false;
+                        self.parts[i].material = autofill::guess_material(&self.parts[i].path, &self.project.autofill);
+                    }
+                }
                 self.resolve_part_dims(i);
                 self.dirty = true;
                 self.set_status(format!("set material for {}", self.parts[i].path));
             }
             PickerTarget::Tag(tag) => {
-                let changed = apply_bulk_material(&mut self.parts, &tag, chosen.as_deref());
+                match &chosen {
+                    Some(name) => {
+                        self.project.autofill.insert(tag.clone(), name.clone());
+                    }
+                    None => {
+                        self.project.autofill.remove(&tag);
+                    }
+                }
+                let changed = apply_bulk_material(&mut self.parts, &self.project.autofill);
                 for i in &changed {
                     self.resolve_part_dims(*i);
                 }
                 self.dirty = true;
-                self.set_status(format!("set material for {} part(s) tagged {tag}", changed.len()));
+                self.set_status(format!("updated the {tag} rule -- {} part(s) changed", changed.len()));
             }
         }
     }
@@ -585,22 +615,22 @@ impl App {
     }
 
     fn save(&mut self) {
-        let map: BTreeMap<String, PartOverride> = self
+        self.project.assignments = self
             .parts
             .iter()
             .filter_map(|p| {
-                // An undecided autofill guess is never frozen into the
-                // sidecar -- only a real user decision (assigned or
-                // explicitly cleared) persists. See `Part::material_decided`.
-                let material = p.material_decided.then(|| p.material.clone());
+                // A rule-derived material is never frozen into an
+                // exception -- only `is_exception` (an explicit per-part
+                // override) persists. See `Part::is_exception`.
+                let material = if p.is_exception { p.material.clone() } else { None };
                 let over = PartOverride { material, swapped: p.swapped };
                 if over.is_empty() { None } else { Some((p.assignment_key.clone(), over)) }
             })
             .collect();
-        match assignments::save(&map, &self.sidecar_path) {
+        match crate::project::save(&self.project, &self.project_path) {
             Ok(()) => {
                 self.dirty = false;
-                let msg = format!("saved {}", self.sidecar_path.display());
+                let msg = format!("saved {}", self.project_path.display());
                 self.set_status(msg);
             }
             Err(e) => self.set_status(format!("save failed: {e}")),
@@ -609,8 +639,8 @@ impl App {
 
     fn open_print_settings(&mut self) {
         self.print_settings = Some(PrintSettings {
-            kerf_in: format_editable(self.kerf_in),
-            trim_allowance_in: format_editable(self.trim_allowance_in),
+            kerf_in: format_editable(self.project.settings.kerf_in),
+            trim_allowance_in: format_editable(self.project.settings.trim_allowance_in),
             focus: PrintField::Kerf,
             kerf_touched: false,
             trim_touched: false,
@@ -655,8 +685,9 @@ impl App {
         let Some(ps) = self.print_settings.take() else { return };
         match (ps.kerf_in.parse::<f64>(), ps.trim_allowance_in.parse::<f64>()) {
             (Ok(kerf_in), Ok(trim_allowance_in)) => {
-                self.kerf_in = kerf_in;
-                self.trim_allowance_in = trim_allowance_in;
+                self.project.settings.kerf_in = kerf_in;
+                self.project.settings.trim_allowance_in = trim_allowance_in;
+                self.dirty = true;
                 self.print();
             }
             _ => self.set_status("kerf and trim allowance must both be numbers, in inches"),
@@ -665,32 +696,32 @@ impl App {
 
     fn print(&mut self) {
         let parts: Vec<PackablePart> = self.parts.iter().map(Part::to_packable).collect();
-        let trim_allowance_mm = self.trim_allowance_in * MM_PER_IN;
-        let layout = pack(&parts, &self.stock, self.kerf_in * MM_PER_IN, trim_allowance_mm);
+        let trim_allowance_mm = self.project.settings.trim_allowance_in * MM_PER_IN;
+        let layout = pack(&parts, &self.stock, self.project.settings.kerf_in * MM_PER_IN, trim_allowance_mm);
         let unplaced = layout.unplaced.len();
+        let out_path = self.project.out_pdf_path(&self.project_path);
         let pdf_bytes = storystick_core::diagrams::render_pdf(&layout, trim_allowance_mm, crate::sections::classify, crate::sections::UNSECTIONED);
-        match std::fs::write(&self.out_pdf_path, pdf_bytes) {
+        match std::fs::write(&out_path, pdf_bytes) {
             Ok(()) => {
                 let msg = if unplaced == 0 {
-                    format!("printed {} ({} sheets)", self.out_pdf_path.display(), layout.sheets.len())
+                    format!("printed {} ({} sheets)", out_path.display(), layout.sheets.len())
                 } else {
-                    format!("printed {} ({} sheets, {} part(s) unplaced)", self.out_pdf_path.display(), layout.sheets.len(), unplaced)
+                    format!("printed {} ({} sheets, {} part(s) unplaced)", out_path.display(), layout.sheets.len(), unplaced)
                 };
                 self.set_status(msg);
             }
-            Err(e) => self.set_status(format!("failed to write {}: {e}", self.out_pdf_path.display())),
+            Err(e) => self.set_status(format!("failed to write {}: {e}", out_path.display())),
         }
     }
 }
 
-pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: f64, trim_allowance_in: f64) -> Result<(), Box<dyn Error>> {
-    let sidecar_path = assignments::sidecar_path(step_path);
-    let existing_assignments = assignments::load(&sidecar_path)?;
+pub(crate) fn run(project: Project, project_path: PathBuf, global_stock: Vec<StockSheet>) -> Result<(), Box<dyn Error>> {
+    let global_materials = stock::distinct_materials(&global_stock);
+    let materials = project.resolve_materials(&global_materials)?;
+    let stock_subset = project.resolve_stock(&global_stock);
+    let step_path = project.step_path(&project_path);
 
-    let catalog = stock::read(stock_path)?;
-    let materials = distinct_materials(&catalog.stock);
-
-    let parts = load_parts(step_path, &existing_assignments, &materials, &catalog.tag_materials)?;
+    let parts = load_parts(&step_path, &project, &materials)?;
 
     let tree_state = TreeState::default();
 
@@ -699,7 +730,7 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
         parts,
         selection_index: HashMap::new(),
         materials,
-        stock: catalog.stock,
+        stock: stock_subset,
         tree_state,
         dirty: false,
         status: help_text.clone(),
@@ -709,11 +740,9 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
         bulk: None,
         print_settings: None,
         confirm_quit: false,
-        step_path: step_path.to_path_buf(),
-        sidecar_path,
-        out_pdf_path: out_pdf.to_path_buf(),
-        kerf_in,
-        trim_allowance_in,
+        step_path,
+        project,
+        project_path,
         last_tree_height: 20,
     };
 
@@ -887,6 +916,7 @@ pub(crate) fn run(step_path: &Path, stock_path: &Path, out_pdf: &Path, kerf_in: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn material(name: &str, thickness_in: f64) -> Material {
         Material { name: name.to_string(), thickness_mm: thickness_in * MM_PER_IN }
@@ -905,7 +935,7 @@ mod tests {
             unreliable,
             thickness_mismatch: false,
             material: material.map(str::to_string),
-            material_decided: material.is_some(),
+            is_exception: material.is_some(),
             swapped: false,
         }
     }
@@ -990,20 +1020,6 @@ mod tests {
     }
 
     #[test]
-    fn distinct_materials_dedupes_by_name_preserving_first_appearance_order() {
-        let bb34 = material("Baltic Birch 3/4", 0.75);
-        let sande34 = material("Sande Ply 3/4", 0.75);
-        let stock = vec![
-            StockSheet { material: bb34.clone(), length_mm: 2438.4, width_mm: 1219.2 },
-            StockSheet { material: sande34, length_mm: 2438.4, width_mm: 1219.2 },
-            StockSheet { material: bb34, length_mm: 1219.2, width_mm: 609.6 },
-        ];
-        let distinct = distinct_materials(&stock);
-        let names: Vec<&str> = distinct.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(names, vec!["Baltic Birch 3/4", "Sande Ply 3/4"]);
-    }
-
-    #[test]
     fn format_editable_trims_trailing_zeros_and_a_bare_zero_stays_zero() {
         assert_eq!(format_editable(0.125), "0.125");
         assert_eq!(format_editable(0.0), "0");
@@ -1031,45 +1047,41 @@ mod tests {
     }
 
     #[test]
-    fn decided_material_is_none_when_no_override_entry_exists() {
-        // "Never decided" -- load_parts is free to seed an autofill guess.
-        assert_eq!(decided_material(None), None);
+    fn resolve_material_exception_always_wins_over_a_rule() {
+        let mut autofill_map = BTreeMap::new();
+        autofill_map.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
+        let (material, is_exception) = resolve_material("Bench / [Panel] Bottom", Some("Sande Ply 3/4".to_string()), &autofill_map);
+        assert_eq!(material.as_deref(), Some("Sande Ply 3/4"));
+        assert!(is_exception);
     }
 
     #[test]
-    fn decided_material_is_none_when_the_override_entry_never_touched_material() {
-        // A swap-only override entry still counts as "never decided" for
-        // material -- autofill is still free to seed a guess.
-        let over = PartOverride { material: None, swapped: true };
-        assert_eq!(decided_material(Some(&over)), None);
+    fn resolve_material_falls_back_to_the_tag_rule_when_no_exception() {
+        let mut autofill_map = BTreeMap::new();
+        autofill_map.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
+        let (material, is_exception) = resolve_material("Bench / [Panel] Bottom", None, &autofill_map);
+        assert_eq!(material.as_deref(), Some("Baltic Birch 3/4"));
+        assert!(!is_exception);
     }
 
     #[test]
-    fn decided_material_distinguishes_assigned_from_explicitly_cleared() {
-        let assigned = PartOverride { material: Some(Some("Baltic Birch 3/4".to_string())), swapped: false };
-        assert_eq!(decided_material(Some(&assigned)), Some(Some("Baltic Birch 3/4".to_string())));
-
-        let cleared = PartOverride { material: Some(None), swapped: false };
-        assert_eq!(decided_material(Some(&cleared)), Some(None));
+    fn resolve_material_is_unassigned_when_no_exception_and_no_rule() {
+        let (material, is_exception) = resolve_material("Bench / Bottom", None, &BTreeMap::new());
+        assert_eq!(material, None);
+        assert!(!is_exception);
     }
 
     #[test]
-    fn save_never_freezes_an_undecided_autofill_guess() {
-        // A part carrying only an autofill guess (material_decided: false)
-        // must not round-trip into a sidecar override -- otherwise a
-        // later stock.yaml change could never re-guess it.
-        let mut p = part(0.75, Some("Baltic Birch 3/4"), false);
-        p.material_decided = false;
-        let over = PartOverride { material: p.material_decided.then(|| p.material.clone()), swapped: p.swapped };
-        assert!(over.is_empty(), "an undecided guess must produce nothing worth saving");
-    }
+    fn save_persists_an_exception_but_never_a_rule_derived_material() {
+        let mut exception = part(0.75, Some("Baltic Birch 3/4"), false);
+        exception.is_exception = true;
+        let saved = if exception.is_exception { exception.material.clone() } else { None };
+        assert_eq!(saved, Some("Baltic Birch 3/4".to_string()));
 
-    #[test]
-    fn save_persists_an_explicit_decision_even_when_it_clears_the_material() {
-        let mut decided_none = part(0.75, None, false);
-        decided_none.material_decided = true;
-        let over = PartOverride { material: decided_none.material_decided.then(|| decided_none.material.clone()), swapped: false };
-        assert_eq!(over.material, Some(None), "an explicit clear must be saved as material: null, not omitted");
+        let mut rule_derived = part(0.75, Some("Baltic Birch 3/4"), false);
+        rule_derived.is_exception = false;
+        let saved = if rule_derived.is_exception { rule_derived.material.clone() } else { None };
+        assert_eq!(saved, None, "a rule-derived material is never frozen into an exception on save");
     }
 
     fn tagged_part(path: &str, material: Option<&str>) -> Part {
@@ -1111,28 +1123,40 @@ mod tests {
     }
 
     #[test]
-    fn apply_bulk_material_only_changes_tagged_parts_and_marks_them_decided() {
-        let mut parts = vec![
-            tagged_part("Bench / [Panel] A", None),
-            tagged_part("Bench / [Backer] B", Some("Sande Ply 3/4")),
-            tagged_part("Bench / [Panel] C", Some("Baltic Birch 1/4")),
-        ];
-        let changed = apply_bulk_material(&mut parts, "[Panel]", Some("Baltic Birch 3/4"));
+    fn apply_bulk_material_re_resolves_every_non_exception_part_from_the_current_rule() {
+        let mut parts = vec![tagged_part("Bench / [Panel] A", None)];
+        parts[0].is_exception = false;
+        let mut autofill_map = BTreeMap::new();
+        autofill_map.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
 
-        assert_eq!(changed, vec![0, 2]);
+        let changed = apply_bulk_material(&mut parts, &autofill_map);
+
+        assert_eq!(changed, vec![0]);
         assert_eq!(parts[0].material.as_deref(), Some("Baltic Birch 3/4"));
-        assert!(parts[0].material_decided);
-        assert_eq!(parts[2].material.as_deref(), Some("Baltic Birch 3/4"));
-        assert!(parts[2].material_decided);
-        // The [Backer] part never carried the [Panel] tag -- untouched.
-        assert_eq!(parts[1].material.as_deref(), Some("Sande Ply 3/4"));
+        assert!(!parts[0].is_exception, "bulk-edit updates the rule, never stamps a per-part exception");
     }
 
     #[test]
-    fn apply_bulk_material_clear_choice_sets_material_none_but_still_decided() {
+    fn apply_bulk_material_never_touches_a_part_with_its_own_exception() {
+        let mut parts = vec![tagged_part("Bench / [Panel] A", Some("Sande Ply 3/4"))];
+        parts[0].is_exception = true;
+        let mut autofill_map = BTreeMap::new();
+        autofill_map.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
+
+        let changed = apply_bulk_material(&mut parts, &autofill_map);
+
+        assert!(changed.is_empty());
+        assert_eq!(parts[0].material.as_deref(), Some("Sande Ply 3/4"), "an exception always outranks the rule, even after the rule changes");
+    }
+
+    #[test]
+    fn apply_bulk_material_removing_a_rule_unassigns_its_non_exception_parts() {
         let mut parts = vec![tagged_part("Bench / [Panel] A", Some("Baltic Birch 3/4"))];
-        apply_bulk_material(&mut parts, "[Panel]", None);
+        parts[0].is_exception = false;
+        // No rule in the map at all -- simulates the rule having just
+        // been removed via bulk-edit's "(clear)".
+        let changed = apply_bulk_material(&mut parts, &BTreeMap::new());
+        assert_eq!(changed, vec![0]);
         assert_eq!(parts[0].material, None);
-        assert!(parts[0].material_decided, "an explicit bulk clear is still a decision, not a reset to undecided");
     }
 }

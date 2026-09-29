@@ -1,8 +1,9 @@
-# Stock catalog: what sheet goods you CAN buy, not what you have on hand.
-# This is meant to be stable across projects -- edit it when you switch
-# material, not per run. `storystick cutlist` reports how many of each
-# sheet a project needs to buy; if you already have some on hand, note
-# that on the BOM by hand afterward.
+# Stock catalog: what sheet goods you CAN buy, not what you have on hand,
+# and not scoped to any one project -- this is the one shop-wide list
+# every project's storystick.yaml picks its own subset from (see
+# storystick.yaml's own materials: list) and maps bracket tags onto (see
+# storystick.yaml's autofill:, authored via the review TUI's bulk-edit).
+# Edit this file when you switch material, not per run.
 #
 # Two sections:
 #   materials -- a name -> thickness catalog. Two materials can share a
@@ -12,24 +13,12 @@
 #   sheets -- purchasable sizes, each naming which material they're a
 #     sheet of. A sheet's thickness always comes from its material, never
 #     repeated here, so two sizes of the same material can't drift.
-#
-# To route a specific part to a specific material (e.g. keep a hidden
-# stretcher off the good plywood), assign that material to the part in
-# the review TUI. Left unassigned, a part matches any material at its own
-# measured thickness -- the common case.
-#
-# `match:` (optional, per material) lists the Shapr3D `[Bracket]` tags
-# that should seed this material as a part's initial guess on load -- a
-# starting point only, the review TUI's flag/correct workflow still
-# catches anything it missed or got wrong.
 
 materials:
   - name: "Baltic Birch 3/4 (finished 2 sides)"
     thickness_in: 0.75
-    match: ["[Panel]"]
   - name: "Sande Ply 3/4 (utility, unseen parts)"
     thickness_in: 0.75
-    match: ["[Backer]"]
   - name: "Baltic Birch 1/4"
     thickness_in: 0.25
 
