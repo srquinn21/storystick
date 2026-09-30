@@ -226,6 +226,22 @@ that validation passes, so downstream code (dimension correction, the
 picker, bulk-edit) carries a real `Material` instead of re-searching the
 catalog by name at each use site. **Implemented.**
 
+One cross-reference remained after this pass: `stock.yaml` itself split
+a material's identity across two top-level lists (`materials`, `sheets`),
+glued back together by a `sheets[].material` name -- the one case that
+*was* already hard-validated (`stock::parse` errors on a miss), but still
+paid for "a material can be sold in more than one sheet size" by
+duplicating its name across two lists for no reason. **Resolved:**
+`sheets` nests under its owning `materials[]` entry instead of
+cross-referencing it by name -- a sheet size can no longer name the wrong
+material (or a renamed/removed one) because it isn't a reference at all,
+and a material's thickness still lives in exactly one place regardless
+of how many sizes it's sold in. `stock::StockDoc` now rejects an unknown
+top-level field (`#[serde(deny_unknown_fields)]`), so a stray pre-nesting
+`sheets:` list fails loudly at parse time instead of silently parsing as
+zero stock. **Implemented** (`scripts/stock.example.yaml` and this
+user's own `~/.config/storystick/stock.yaml` both migrated).
+
 ### Bulk-edit mode (by tag)
 
 Proposed to handle scale once a project is one big export: a mode that

@@ -5,30 +5,29 @@
 # storystick.yaml's autofill:, authored via the review TUI's bulk-edit).
 # Edit this file when you switch material, not per run.
 #
-# Two sections:
-#   materials -- a name -> thickness catalog. Two materials can share a
-#     thickness (e.g. two different 3/4" plies below) while being
-#     genuinely different stock -- that's the whole point of naming them
-#     separately instead of just keying everything off thickness_in.
-#   sheets -- purchasable sizes, each naming which material they're a
-#     sheet of. A sheet's thickness always comes from its material, never
-#     repeated here, so two sizes of the same material can't drift.
+# One list, materials: each entry names a material, its thickness, and
+# every size it's sold in (sheets:, nested here rather than a separate
+# top-level list cross-referenced by name). Two materials can share a
+# thickness (e.g. the two 3/4" plies below) while being genuinely
+# different stock -- that's the whole point of naming them separately
+# instead of just keying everything off thickness_in. A material sold in
+# more than one size just lists more than one entry under its own
+# sheets: -- its thickness is still typed in exactly one place either
+# way.
 
 materials:
   - name: "Baltic Birch 3/4 (finished 2 sides)"
     thickness_in: 0.75
+    sheets:
+      - length_in: 96
+        width_in: 48
   - name: "Sande Ply 3/4 (utility, unseen parts)"
     thickness_in: 0.75
+    sheets:
+      - length_in: 96
+        width_in: 48
   - name: "Baltic Birch 1/4"
     thickness_in: 0.25
-
-sheets:
-  - material: "Baltic Birch 3/4 (finished 2 sides)"
-    length_in: 96
-    width_in: 48
-  - material: "Sande Ply 3/4 (utility, unseen parts)"
-    length_in: 96
-    width_in: 48
-  - material: "Baltic Birch 1/4"
-    length_in: 96
-    width_in: 48
+    sheets:
+      - length_in: 96
+        width_in: 48

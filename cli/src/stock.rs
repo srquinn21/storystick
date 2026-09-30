@@ -8,30 +8,41 @@
 
 use crate::MM_PER_IN;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use storystick_core::nesting::{Material, StockSheet};
 
 #[derive(Debug, Deserialize)]
-struct MaterialEntry {
-    name: String,
-    thickness_in: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct SheetEntry {
-    material: String,
+#[serde(deny_unknown_fields)]
+struct SheetSizeEntry {
     length_in: f64,
     width_in: f64,
 }
 
+/// One buyable material: a name, its thickness, and every size it's sold
+/// in. Sheet sizes are nested here rather than cross-referenced by name
+/// from a separate top-level list, so a sheet can't name the wrong
+/// material (or a material that's been renamed or removed since) --
+/// there's no name to get wrong, and a material's thickness is typed in
+/// exactly one place no matter how many sizes it's sold in.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaterialEntry {
+    name: String,
+    thickness_in: f64,
+    #[serde(default)]
+    sheets: Vec<SheetSizeEntry>,
+}
+
+/// `deny_unknown_fields` here (not just diagnostic elsewhere) so a
+/// leftover top-level `sheets:` from the pre-nesting format fails loudly
+/// at parse time instead of silently being ignored -- which would
+/// otherwise leave every material with zero sheets and no stock at all.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct StockDoc {
     #[serde(default)]
     materials: Vec<MaterialEntry>,
-    #[serde(default)]
-    sheets: Vec<SheetEntry>,
 }
 
 /// `$XDG_CONFIG_HOME/storystick/stock.yaml`, falling back to
@@ -46,11 +57,10 @@ pub(crate) fn default_path() -> PathBuf {
     config_home.join("storystick").join("stock.yaml")
 }
 
-/// stock.yaml has two sections: `materials` (a name -> thickness catalog
-/// -- see `Material`) and `sheets` (purchasable sizes, each naming which
-/// material they're a sheet of). A sheet's thickness always comes from
-/// its named material, never repeated per-sheet, so two sheet sizes of
-/// the same material can't drift out of sync on thickness.
+/// stock.yaml is one list, `materials`: each entry names a material, its
+/// thickness, and every size it's sold in (`sheets`, nested -- see
+/// `MaterialEntry`). There's no cross-list reference to resolve or get
+/// wrong.
 ///
 /// Pure parsing/validation, no file I/O -- kept separate from `read` so it
 /// can be exercised directly with an in-memory string, the same way every
@@ -59,18 +69,12 @@ pub(crate) fn default_path() -> PathBuf {
 pub(crate) fn parse(text: &str) -> Result<Vec<StockSheet>, Box<dyn Error>> {
     let doc: StockDoc = yaml_serde::from_str(text)?;
 
-    let materials: HashMap<String, Material> = doc
-        .materials
-        .into_iter()
-        .map(|m| (m.name.clone(), Material { name: m.name, thickness_mm: m.thickness_in * MM_PER_IN }))
-        .collect();
-
     let mut stock = Vec::new();
-    for entry in doc.sheets {
-        let material = materials
-            .get(&entry.material)
-            .ok_or_else(|| format!("stock.yaml: sheet references unknown material {:?}", entry.material))?;
-        stock.push(StockSheet { material: material.clone(), length_mm: entry.length_in * MM_PER_IN, width_mm: entry.width_in * MM_PER_IN });
+    for entry in doc.materials {
+        let material = Material { name: entry.name, thickness_mm: entry.thickness_in * MM_PER_IN };
+        for sheet in entry.sheets {
+            stock.push(StockSheet { material: material.clone(), length_mm: sheet.length_in * MM_PER_IN, width_mm: sheet.width_in * MM_PER_IN });
+        }
     }
     Ok(stock)
 }
@@ -106,21 +110,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_reads_materials_and_sheets() {
+    fn parse_reads_materials_with_their_nested_sheets() {
         let yaml = r#"
 materials:
   - name: "Baltic Birch 3/4 (finished 2 sides)"
     thickness_in: 0.75
+    sheets:
+      - length_in: 96
+        width_in: 48
   - name: "Baltic Birch 1/4"
     thickness_in: 0.25
-
-sheets:
-  - material: "Baltic Birch 3/4 (finished 2 sides)"
-    length_in: 96
-    width_in: 48
-  - material: "Baltic Birch 1/4"
-    length_in: 96
-    width_in: 48
+    sheets:
+      - length_in: 96
+        width_in: 48
 "#;
         let stock = parse(yaml).unwrap();
 
@@ -139,33 +141,45 @@ sheets:
 materials:
   - name: "Baltic Birch 3/4"
     thickness_in: 0.75
-
-sheets:
-  - material: "Baltic Birch 3/4"
-    length_in: 96
-    width_in: 48
-  - material: "Baltic Birch 3/4"
-    length_in: 60
-    width_in: 30
+    sheets:
+      - length_in: 96
+        width_in: 48
+      - length_in: 60
+        width_in: 30
 "#;
         let stock = parse(yaml).unwrap();
+        assert_eq!(stock.len(), 2);
         assert_eq!(stock[0].material.thickness_mm, stock[1].material.thickness_mm);
     }
 
     #[test]
-    fn parse_errs_when_a_sheet_references_an_unknown_material() {
+    fn parse_a_material_with_no_sheets_yields_no_stock_for_it() {
+        let yaml = r#"
+materials:
+  - name: "Baltic Birch 3/4"
+    thickness_in: 0.75
+"#;
+        assert!(parse(yaml).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_errs_on_the_pre_nesting_top_level_sheets_format() {
+        // A leftover top-level `sheets:` list from before sheets nested
+        // under their material must fail loudly, not silently parse as
+        // zero stock for every material (which `#[serde(default)]` alone
+        // would do, since the field would just go unrecognized).
         let yaml = r#"
 materials:
   - name: "Baltic Birch 3/4"
     thickness_in: 0.75
 
 sheets:
-  - material: "Sande Ply 3/4"
+  - material: "Baltic Birch 3/4"
     length_in: 96
     width_in: 48
 "#;
         let err = parse(yaml).unwrap_err();
-        assert!(err.to_string().contains("Sande Ply 3/4"), "error should name the unresolved material: {err}");
+        assert!(err.to_string().contains("sheets"), "error should name the stray top-level field: {err}");
     }
 
     #[test]

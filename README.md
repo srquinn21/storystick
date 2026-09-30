@@ -35,16 +35,14 @@ cp scripts/stock.example.yaml ~/.config/storystick/stock.yaml
 materials:
   - name: "Baltic Birch 3/4 (finished 2 sides)"
     thickness_in: 0.75
+    sheets:
+      - length_in: 96
+        width_in: 48
   - name: "Sande Ply 3/4 (utility, unseen parts)"
     thickness_in: 0.75
-
-sheets:
-  - material: "Baltic Birch 3/4 (finished 2 sides)"
-    length_in: 96
-    width_in: 48
-  - material: "Sande Ply 3/4 (utility, unseen parts)"
-    length_in: 96
-    width_in: 48
+    sheets:
+      - length_in: 96
+        width_in: 48
 ```
 
 Two materials can share a thickness -- that's what lets you keep hidden
