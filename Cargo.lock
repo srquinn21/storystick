@@ -1237,6 +1237,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nucleo-matcher"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf33f538733d1a5a3494b836ba913207f14d9d4a1d3cd67030c5061bdd2cac85"
+dependencies = [
+ "memchr",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1983,10 +1993,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crossterm",
+ "nucleo-matcher",
  "ratatui",
  "serde",
  "storystick-core",
- "tui-tree-widget",
  "yaml_serde",
 ]
 
@@ -2225,17 +2235,6 @@ name = "tinyvec"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
-
-[[package]]
-name = "tui-tree-widget"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "246c1142baa1e7a42b94f0fb2b60d838fc884c16281e330bf8624da65ed8f89a"
-dependencies = [
- "ratatui-core",
- "ratatui-widgets",
- "unicode-width",
-]
 
 [[package]]
 name = "typenum"

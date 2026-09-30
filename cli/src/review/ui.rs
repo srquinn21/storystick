@@ -1,28 +1,63 @@
-use super::{tree, App, BulkState, PickerTarget, PrintField};
+use super::{tree, App, BulkState, Command, PartEditField, PickerTarget, PrintField};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use tui_tree_widget::Tree;
 
-/// The tree screen's resting bottom-line help, as (key, action) pairs so
-/// `help_line` can color the key distinctly from what it does. No part
-/// count here -- that's already the top-right title's `resolved` count
-/// (see `draw_tree`), and a bare `42` here with no unit would be a
-/// second, differently-shaped answer to the same question.
-const TREE_HELP: &[(&str, &str)] = &[
-    ("j/k", "move"),
-    ("h/l", "fold"),
-    ("e/c", "expand/collapse all"),
-    ("Enter/m", "assign"),
-    ("b", "bulk edit"),
-    ("g", "swap L/W"),
-    ("Ctrl-d/u", "page"),
-    ("s", "save"),
-    ("p", "print"),
-    ("q", "quit"),
+/// The main screen's resting bottom-line help -- deliberately just a
+/// pointer to the full reference (`?`, see `HELP_SECTIONS`/
+/// `draw_help_screen`) rather than trying to cram every binding into one
+/// line. This line is also `App::default_status`, so shrinking it also
+/// frees up the status line for transient messages (a save confirmation,
+/// an error) most of the time.
+const TREE_HELP: &[(&str, &str)] = &[("?", "help")];
+
+/// Every binding, grouped for the full-screen reference (`?`, see
+/// `draw_help_screen`) -- the one authoritative, always-accurate list,
+/// since the resting status line (`TREE_HELP`) no longer tries to be.
+const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Movement",
+        &[
+            ("j / k", "move selection"),
+            ("h / l", "up a level / drill in"),
+            ("gg / G", "top / bottom"),
+            ("Enter", "edit part / drill in"),
+        ],
+    ),
+    (
+        "Find",
+        &[
+            ("/", "fuzzy-jump to a part by name"),
+            ("]f / [f", "next / previous flagged part"),
+            ("n / N", "repeat the last jump, forward / back"),
+        ],
+    ),
+    (
+        "Commands",
+        &[
+            ("space, then b", "bulk edit"),
+            ("space, then p", "print settings"),
+            ("Ctrl-p", "command palette"),
+        ],
+    ),
+    (
+        "Part edit",
+        &[
+            ("Tab / j / k", "switch Material / Grain"),
+            ("Enter", "edit the focused field"),
+        ],
+    ),
+    (
+        "Other",
+        &[("w", "save"), ("q", "quit"), ("?", "this help screen")],
+    ),
 ];
+
+/// Shown on the bottom status line while the full help screen (`App::
+/// help_open`) has focus.
+const HELP_SCREEN_HELP: &[(&str, &str)] = &[("Esc / q / ?", "close")];
 
 /// Shown on the bottom status line while bulk-edit's tag list (see
 /// `BulkState`) has focus.
@@ -33,9 +68,34 @@ const BULK_TAG_HELP: &[(&str, &str)] =
 /// either a single part's or a bulk-edit tag's) has focus.
 const PICKER_HELP: &[(&str, &str)] = &[("j/k", "move"), ("Enter", "confirm"), ("Esc", "cancel")];
 
+/// Shown on the bottom status line while a part's edit modal (`App::
+/// part_edit`) has focus.
+const PART_EDIT_HELP: &[(&str, &str)] = &[
+    ("Tab/j/k", "switch field"),
+    ("Enter", "edit field"),
+    ("Esc", "done"),
+];
+
+/// Shown on the bottom status line while the command palette (`App::
+/// palette`) has focus.
+const PALETTE_HELP: &[(&str, &str)] = &[
+    ("type", "filter"),
+    ("Up/Down", "move"),
+    ("Enter", "run"),
+    ("Esc", "cancel"),
+];
+
+/// Shown on the bottom status line while `/`'s own input line (`App::
+/// jump`, while `editing`) has focus.
+const NAME_JUMP_HELP: &[(&str, &str)] = &[
+    ("type", "filter by name"),
+    ("Enter", "jump"),
+    ("Esc", "cancel"),
+];
+
 /// Shown on the bottom status line (see `draw_status`) while the
-/// print-settings popup has focus, replacing the tree's own keyboard
-/// help -- none of those keys apply while this popup is open.
+/// print-settings popup has focus, replacing the resting help line --
+/// none of those keys apply while this popup is open.
 const PRINT_HELP: &[(&str, &str)] = &[
     ("Tab", "switch field"),
     ("Enter", "print"),
@@ -101,18 +161,28 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    draw_tree(frame, chunks[0], app);
+    draw_assembly_list(frame, chunks[0], app);
     draw_status(frame, chunks[1], app);
 
-    // Bulk-edit's tag list is drawn before the picker so that, when a tag
-    // hands off to the shared material picker (`App::picker`, left open
-    // underneath -- see `BulkState`), the picker renders on top of the
-    // tag list rather than being hidden behind it.
+    // Each of these draws on top of whatever's already on screen, in an
+    // order chosen so a modal that hands off to another (bulk-edit and
+    // part-edit both hand off to the material picker) is drawn first,
+    // leaving the one it handed off to on top -- mirroring `run`'s own
+    // key-handling priority.
     if app.bulk.is_some() {
         draw_bulk(frame, area, app);
     }
+    if app.part_edit.is_some() {
+        draw_part_edit(frame, area, app);
+    }
     if app.picker.is_some() {
         draw_picker(frame, area, app);
+    }
+    if app.palette.is_some() {
+        draw_command_palette(frame, area, app);
+    }
+    if matches!(&app.jump, Some(j) if j.editing) {
+        draw_name_jump_prompt(frame, area, app);
     }
     if app.print_settings.is_some() {
         draw_print_settings(frame, area, app);
@@ -120,36 +190,39 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     if app.confirm_quit {
         draw_confirm_quit(frame, area);
     }
+    if app.help_open {
+        draw_help_screen(frame, area);
+    }
 }
 
-fn draw_tree(frame: &mut Frame, area: Rect, app: &mut App) {
-    let (items, selection_index) = tree::build(&app.parts, &app.materials);
-    app.selection_index = selection_index;
+fn draw_assembly_list(frame: &mut Frame, area: Rect, app: &mut App) {
+    let rows = tree::rows_at(&app.parts, &app.materials, &app.breadcrumb)
+        .expect("breadcrumb only ever holds paths this session's own navigation produced");
     let (resolved, total) = app.resolved_counts();
     // Red until every part is cleanly resolved (material assigned, no
     // `part_flag` left standing), then green -- the count is the one
-    // thing in the title actually worth a glance-and-go signal; the rest
-    // of the title is just identifying which file this is.
+    // thing in the title actually worth a glance-and-go signal.
     let count_color = if total > 0 && resolved == total {
         Color::Green
     } else {
         Color::Red
     };
-    // The full path is mostly the same directory over and over across a
-    // multi-file project (e.g. this model's own `-Carcass`/`-Uppers`
-    // siblings) -- the file name is the part that actually distinguishes
-    // one run's title from another.
-    let file_name = app
-        .step_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| app.step_path.display().to_string());
+    // The breadcrumb, not the file name, is the thing that actually
+    // changes as you navigate -- there's normally exactly one STEP file
+    // open at a time (see `docs/poc.md`'s single-full-project-export
+    // direction), so "where am I" earns the title bar far more often
+    // than "which file" does.
+    let location = if app.breadcrumb.is_empty() {
+        "Project root".to_string()
+    } else {
+        app.breadcrumb.join(" / ")
+    };
     let left_spans = vec![
         Span::styled(
             " storystick -- ",
             Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(file_name),
+        Span::raw(location),
     ];
     // `[modified]` goes last so it sits at the very right edge of the
     // border, past the resolved count -- the most urgent thing (unsaved
@@ -168,12 +241,12 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &mut App) {
     right_spans.push(Span::raw(" "));
     let right_title = Line::from(right_spans).right_aligned();
 
-    // The tree widget has no header row of its own, so the outer block is
-    // rendered here directly (not via `Tree::block`) to make room for a
+    // The row list has no header of its own, so the outer block is
+    // rendered here directly (not via `List::block`) to make room for a
     // fixed header line, column-aligned with each leaf row, above it.
     // Two separate titles (rather than one line with padding in between)
     // so the resolved count stays pinned to the border's right edge
-    // regardless of how long the file name is.
+    // regardless of how long the breadcrumb is.
     let block = Block::default()
         .borders(Borders::ALL)
         .title_top(Line::from(left_spans))
@@ -181,42 +254,61 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let rows = Layout::default()
+    let inner_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
-    frame.render_widget(Paragraph::new(tree::header_line()), rows[0]);
+    frame.render_widget(Paragraph::new(tree::header_line()), inner_rows[0]);
 
-    let widget = Tree::new(&items)
-        .expect("sibling names disambiguated in tree::insert")
-        .highlight_style(Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol(tree::HIGHLIGHT_SYMBOL);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| {
+            let line = match row.kind {
+                tree::RowKind::Leaf {
+                    part_index,
+                    flagged,
+                } => tree::leaf_line(&app.parts[part_index], flagged),
+                tree::RowKind::Folder { flagged } => tree::folder_line(&row.name, flagged),
+            };
+            ListItem::new(line)
+        })
+        .collect();
+    let list =
+        List::new(items).highlight_style(Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD));
 
-    // What a page-scroll (Ctrl-d/u) should actually jump by.
-    app.last_tree_height = rows[1].height;
-
-    frame.render_stateful_widget(widget, rows[1], &mut app.tree_state);
+    frame.render_stateful_widget(list, inner_rows[1], &mut app.list_state);
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    // While any popup has focus, the tree's own keys (j/k, e/c, m, g,
-    // s...) don't apply -- showing them here would be actively misleading
-    // about what the keyboard does right now. A transient message (a save
-    // confirmation, an error) is free-form prose, not key/action pairs,
-    // so it renders plain rather than through `help_line`. `picker` is
-    // checked ahead of `bulk` since a bulk-edit tag hands off to the
-    // picker while leaving itself in place underneath (see `BulkState`),
-    // so both can be `Some` at once and the picker is the one with focus.
+    // While any popup has focus, the main screen's own keys don't apply
+    // -- showing them here would be actively misleading about what the
+    // keyboard does right now. A transient message (a save confirmation,
+    // an error) is free-form prose, not key/action pairs, so it renders
+    // plain rather than through `help_line`. `picker` is checked ahead of
+    // `bulk`/`part_edit` since both hand off to it while leaving
+    // themselves in place underneath, so more than one can be `Some` at
+    // once and the picker is the one with focus.
     let line = if app.print_settings.is_some() {
         help_line(PRINT_HELP)
     } else if app.confirm_quit {
         help_line(QUIT_HELP)
+    } else if app.help_open {
+        help_line(HELP_SCREEN_HELP)
     } else if app.picker.is_some() {
         help_line(PICKER_HELP)
     } else if matches!(app.bulk, Some(BulkState::PickTag { .. })) {
         help_line(BULK_TAG_HELP)
+    } else if app.part_edit.is_some() {
+        help_line(PART_EDIT_HELP)
+    } else if app.palette.is_some() {
+        help_line(PALETTE_HELP)
+    } else if matches!(&app.jump, Some(j) if j.editing) {
+        help_line(NAME_JUMP_HELP)
     } else if app.status_is_default() {
-        help_line(TREE_HELP)
+        // Right-aligned, unlike every other help line here -- it's just
+        // a pointer to the real reference (`?`), not something worth the
+        // same left-edge prominence as an active modal's own keys.
+        help_line(TREE_HELP).right_aligned()
     } else {
         Line::from(app.status.as_str())
     };
@@ -304,6 +396,149 @@ fn draw_bulk(frame: &mut Frame, area: Rect, app: &mut App) {
         .highlight_symbol(">> ");
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, list_state);
+}
+
+/// A single part's Material + Grain fields on one screen (`App::
+/// part_edit`) -- Tab/`j`/`k` cycles which field is focused, `Enter` acts
+/// on it (opens the material picker, or toggles grain directly). Drawn
+/// before `draw_picker` in `draw` so a Material-triggered picker renders
+/// on top of this.
+fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(pe) = &app.part_edit else {
+        return;
+    };
+    let part = &app.parts[pe.part_index];
+    let popup = centered_rect(60, 6, area);
+
+    let field_line = |label: &str, value: &str, focused: bool| {
+        let text = format!(" {label:<12}{value}");
+        if focused {
+            Line::styled(
+                text,
+                Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Line::from(text)
+        }
+    };
+
+    let material = part
+        .material
+        .as_ref()
+        .map(|m| m.name.as_str())
+        .unwrap_or("-");
+    let grain = if part.swapped {
+        "swapped"
+    } else {
+        "as measured"
+    };
+
+    let lines = vec![
+        field_line("Material:", material, pe.focus == PartEditField::Material),
+        Line::from(""),
+        field_line("Grain:", grain, pe.focus == PartEditField::Grain),
+    ];
+
+    let title = format!(" {} ", part.path);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let paragraph = Paragraph::new(lines).block(block);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+/// The `ctrl+p` command palette (`App::palette`): a query line filtering
+/// `Command::all()` by fuzzy match, ranked best-first.
+fn draw_command_palette(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(palette) = &app.palette else {
+        return;
+    };
+    let labels: Vec<&str> = Command::all().iter().map(Command::label).collect();
+    let title = format!(" command: {} ", palette.query);
+    let width = popup_width(
+        30,
+        labels
+            .iter()
+            .map(|l| l.chars().count())
+            .chain(std::iter::once(title.chars().count())),
+    );
+    let popup = centered_rect(width, (palette.matches.len() as u16 + 4).min(20), area);
+
+    let items: Vec<ListItem> = palette
+        .matches
+        .iter()
+        .map(|&i| ListItem::new(labels[i]))
+        .collect();
+    let mut list_state = ListState::default();
+    list_state.select(Some(palette.selected));
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol(">> ");
+
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut list_state);
+}
+
+/// The `/` fuzzy-jump-by-name prompt (`App::filter`, while `editing`) --
+/// no list on screen, since cycling through ranked matches happens via
+/// `n`/`N` once this input line closes on `Enter`.
+fn draw_name_jump_prompt(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(j) = &app.jump else {
+        return;
+    };
+    let popup = centered_rect(50, 3, area);
+    let position = if j.matches.is_empty() {
+        "no matches".to_string()
+    } else {
+        format!("{}/{} matches", j.current + 1, j.matches.len())
+    };
+    let text = format!(" /{}", j.query);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {position} "));
+    let paragraph = Paragraph::new(Line::from(text)).block(block);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+/// The full keybinding reference (bare `?`, `App::help_open`) -- a
+/// static, grouped listing of `HELP_SECTIONS`, the one authoritative
+/// place every binding is documented, so the resting status line
+/// (`TREE_HELP`) doesn't have to try.
+fn draw_help_screen(frame: &mut Frame, area: Rect) {
+    let width = 56u16;
+    let height = HELP_SECTIONS
+        .iter()
+        .map(|(_, pairs)| pairs.len() as u16 + 2)
+        .sum::<u16>()
+        + 2;
+    let popup = centered_rect(width, height, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (section, pairs) in HELP_SECTIONS {
+        lines.push(Line::styled(
+            format!(" {section}"),
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+        for (key, action) in *pairs {
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(format!("{key:<14}"), Style::new().fg(Color::Blue)),
+                Span::styled(*action, Style::new().fg(Color::DarkGray)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Keybindings ");
+    let paragraph = Paragraph::new(lines).block(block);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
 }
 
 fn draw_confirm_quit(frame: &mut Frame, area: Rect) {

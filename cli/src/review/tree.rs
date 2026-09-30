@@ -1,13 +1,20 @@
-//! Builds the tui-tree-widget item tree from the flat part list, mirroring
-//! the CAD assembly hierarchy each part's path already encodes (folders
-//! are just path segments -- there's no separate model for them).
+//! Builds the assembly hierarchy the review TUI navigates, mirroring the
+//! CAD assembly hierarchy each part's path already encodes (folders are
+//! just path segments -- there's no separate model for them). Every
+//! folder is an assembly; a part with no children is just a trivial
+//! one-part assembly, so there's no special-casing between the two here.
+//!
+//! The TUI shows one assembly's direct children at a time (see
+//! `App::breadcrumb`/`App::current_rows` in `mod.rs`), not the whole tree
+//! at once -- `rows_at` is the one function that answers "what's under
+//! this path," and `locate_part`/`navigate_to_part` are the reverse
+//! direction, turning a part index back into a breadcrumb.
 
 use super::{part_flag, Part};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::collections::HashMap;
 use storystick_core::nesting::Material;
-use tui_tree_widget::TreeItem;
 
 enum Node {
     Folder {
@@ -19,44 +26,27 @@ enum Node {
     },
 }
 
-/// Deepest folder nesting a row's column alignment compensates for (see
-/// `depth_indent`). A row deeper than this still renders correctly, just
-/// with its columns drifted right of the header -- there's no
-/// correctness issue, only a cosmetic one, past this depth.
-const MAX_EXPECTED_DEPTH: usize = 4;
-
-/// Passed to `Tree::highlight_symbol` in `ui::draw_tree` -- shared from
-/// here, not redeclared there, so the column math below and the actual
-/// rendered symbol can never silently drift apart. Empty: the selected
-/// row's own blue highlight background is already an unambiguous marker,
-/// and a real symbol here would reserve its width as permanent blank
-/// indent on every row, selected or not.
-pub(super) const HIGHLIGHT_SYMBOL: &str = "";
-
-/// Before a row's own `text` even starts, tui-tree-widget draws, in
-/// order: `highlight_symbol`'s width as reserved space on *every* row
-/// (zero-width here, see `HIGHLIGHT_SYMBOL`), then `depth * 2` indent
-/// columns, then a 2-wide expand/collapse symbol. A row's `text` then
-/// adds its own 2-wide prefix
-/// -- a real flag marker for a leaf (see `leaf_line`), two blank spaces
-/// standing in for one on a folder (see `folder_line`), so both line up
-/// identically. None of this is visible to `header_line`, which is a
-/// separate `Paragraph` drawn with no tree-widget involvement at all --
-/// so for the header's "Part" label to land in the same screen column as
-/// every row's name, regardless of depth, `depth_indent` pads a row by
-/// `(MAX_EXPECTED_DEPTH - depth) * 2` extra spaces before that 2-wide
-/// prefix, exactly cancelling out the depth-dependent part of the
-/// widget's own indent -- and `header_line` pads by this same total
-/// (highlight symbol + depth-independent remainder) up front, since it
-/// has no widget-drawn prefix of its own to offset against.
-const NAME_COLUMN_START: usize = HIGHLIGHT_SYMBOL.len() + MAX_EXPECTED_DEPTH * 2 + 4;
-
-/// Width of the name column itself (folder or leaf name, after the
-/// indent/marker prefix), before the vertical rule and data columns.
+/// Width of the name column itself (folder or leaf name), before the
+/// vertical rule and data columns on a leaf row.
 const NAME_FIELD_WIDTH: usize = 32;
 
-fn depth_indent(depth: usize) -> String {
-    " ".repeat(MAX_EXPECTED_DEPTH.saturating_sub(depth) * 2)
+/// Left padding shared by every row (folder or leaf) so names all start
+/// in the same screen column regardless of kind -- a leaf's own flag
+/// marker (`! `/`  `) is exactly this wide; a folder has no marker of
+/// its own; and this is a flat, single-level list now, so there's no
+/// per-row depth to additionally compensate for.
+const ROW_PREFIX_WIDTH: usize = 2;
+
+/// One row of the current assembly's direct children -- either a
+/// sub-assembly (folder) or a part (leaf), never both.
+pub(super) struct Row {
+    pub(super) name: String,
+    pub(super) kind: RowKind,
+}
+
+pub(super) enum RowKind {
+    Folder { flagged: usize },
+    Leaf { part_index: usize, flagged: bool },
 }
 
 /// The rule separating the tree (folders and part names) from the data
@@ -76,58 +66,6 @@ fn build_nodes(parts: &[Part]) -> (Vec<String>, HashMap<String, Node>) {
         insert(&mut order, &mut children, &segments, i);
     }
     (order, children)
-}
-
-/// Returns the tree items to render, plus a map from a leaf's identifier
-/// path (joined the same way `TreeState::selected()` joins it, " / "
-/// between segments) to its part index -- the identifier can differ from
-/// `Part::path` when a same-named sibling forced disambiguation (see
-/// `insert`), so this map is the only correct way back to a part index.
-pub(super) fn build(
-    parts: &[Part],
-    materials: &[Material],
-) -> (Vec<TreeItem<'static, String>>, HashMap<String, usize>) {
-    let (order, children) = build_nodes(parts);
-    let mut selection_index = HashMap::new();
-    let items = to_items(
-        &order,
-        &children,
-        parts,
-        materials,
-        &[],
-        &mut selection_index,
-    );
-    (items, selection_index)
-}
-
-/// Every folder's identifier path, for `TreeState::open` -- there's no
-/// built-in "open everything" on `TreeState` (only `close_all`), so
-/// expand-all is just opening every one of these.
-pub(super) fn all_folder_paths(parts: &[Part]) -> Vec<Vec<String>> {
-    let (order, children) = build_nodes(parts);
-    let mut paths = Vec::new();
-    collect_folder_paths(&order, &children, &[], &mut paths);
-    paths
-}
-
-fn collect_folder_paths(
-    order: &[String],
-    children: &HashMap<String, Node>,
-    prefix: &[String],
-    out: &mut Vec<Vec<String>>,
-) {
-    for name in order {
-        if let Node::Folder {
-            order: sub_order,
-            children: sub_children,
-        } = &children[name]
-        {
-            let mut path: Vec<String> = prefix.to_vec();
-            path.push(name.clone());
-            out.push(path.clone());
-            collect_folder_paths(sub_order, sub_children, &path, out);
-        }
-    }
 }
 
 /// Two parts landing on the exact same path (or a leaf's own name
@@ -194,54 +132,146 @@ fn count_flagged(
         .sum()
 }
 
-fn to_items(
-    order: &[String],
-    children: &HashMap<String, Node>,
-    parts: &[Part],
-    materials: &[Material],
-    path_prefix: &[String],
-    selection_index: &mut HashMap<String, usize>,
-) -> Vec<TreeItem<'static, String>> {
-    order
-        .iter()
-        .map(|name| {
-            let mut path: Vec<String> = path_prefix.to_vec();
-            path.push(name.clone());
-            let depth = path_prefix.len();
-            match &children[name] {
-                Node::Leaf { part_index } => {
-                    selection_index.insert(path.join(" / "), *part_index);
-                    let part = &parts[*part_index];
-                    let flagged = part_flag(part, materials).is_some();
-                    TreeItem::new_leaf(name.clone(), leaf_line(part, flagged, depth))
-                }
+/// Direct children of the assembly at `path` (an empty path means the
+/// project root), in insertion order -- never the whole subtree, just
+/// one level. `None` if `path` runs through a leaf, or names a segment
+/// that doesn't exist (e.g. a stale breadcrumb -- callers that build
+/// `path` from `locate_part`/`navigate_to_part` never hit this in
+/// practice, since `Part::path` never changes mid-session).
+pub(super) fn rows_at(parts: &[Part], materials: &[Material], path: &[String]) -> Option<Vec<Row>> {
+    let (root_order, root_children) = build_nodes(parts);
+    let mut order = &root_order;
+    let mut children = &root_children;
+    for segment in path {
+        match children.get(segment)? {
+            Node::Folder {
+                order: o,
+                children: c,
+            } => {
+                order = o;
+                children = c;
+            }
+            Node::Leaf { .. } => return None,
+        }
+    }
+    Some(
+        order
+            .iter()
+            .map(|name| match &children[name] {
+                Node::Leaf { part_index } => Row {
+                    name: name.clone(),
+                    kind: RowKind::Leaf {
+                        part_index: *part_index,
+                        flagged: part_flag(&parts[*part_index], materials).is_some(),
+                    },
+                },
                 Node::Folder {
                     order: sub_order,
                     children: sub_children,
-                } => {
-                    let flagged = count_flagged(sub_order, sub_children, parts, materials);
-                    let sub_items = to_items(
-                        sub_order,
-                        sub_children,
-                        parts,
-                        materials,
-                        &path,
-                        selection_index,
-                    );
-                    TreeItem::new(name.clone(), folder_line(name, flagged), sub_items)
-                        .expect("sibling names disambiguated in `insert`")
+                } => Row {
+                    name: name.clone(),
+                    kind: RowKind::Folder {
+                        flagged: count_flagged(sub_order, sub_children, parts, materials),
+                    },
+                },
+            })
+            .collect(),
+    )
+}
+
+fn find_part(
+    order: &[String],
+    children: &HashMap<String, Node>,
+    target_index: usize,
+) -> Option<Vec<String>> {
+    for name in order {
+        match &children[name] {
+            Node::Leaf { part_index } if *part_index == target_index => {
+                return Some(vec![name.clone()]);
+            }
+            Node::Leaf { .. } => continue,
+            Node::Folder {
+                order: o,
+                children: c,
+            } => {
+                if let Some(mut sub_path) = find_part(o, c, target_index) {
+                    sub_path.insert(0, name.clone());
+                    return Some(sub_path);
                 }
             }
-        })
-        .collect()
+        }
+    }
+    None
+}
+
+/// A part's full disambiguated path (folder segments, then its own
+/// possibly-`" (2)"`-suffixed name) within the current assembly tree --
+/// the only correct way to turn a part index back into a breadcrumb,
+/// since same-named siblings can disambiguate (see `insert`).
+pub(super) fn locate_part(parts: &[Part], target_index: usize) -> Vec<String> {
+    let (order, children) = build_nodes(parts);
+    find_part(&order, &children, target_index)
+        .expect("target_index must name a real part in `parts`")
+}
+
+/// Where to land the breadcrumb/selection to show `target_index`: the
+/// assembly path containing it, plus that part's row position within
+/// `rows_at(parts, materials, &that_path)`. The one chokepoint both
+/// jump-to-flagged and fuzzy-jump-by-name call to land on a specific
+/// part, so "find a part, then show it" is implemented exactly once.
+pub(super) fn navigate_to_part(
+    parts: &[Part],
+    materials: &[Material],
+    target_index: usize,
+) -> (Vec<String>, usize) {
+    let mut path = locate_part(parts, target_index);
+    let leaf_name = path.pop().expect("locate_part never returns an empty path");
+    let rows = rows_at(parts, materials, &path)
+        .expect("a path popped from locate_part's own result is always valid");
+    let row_index = rows
+        .iter()
+        .position(|r| r.name == leaf_name)
+        .expect("leaf_name must appear among its own parent's rows");
+    (path, row_index)
+}
+
+/// Every part index in depth-first tree order -- the order a user
+/// actually encounters parts browsing the assembly list top to bottom,
+/// drilling into each sub-assembly before moving to its next sibling.
+/// This is *not* the same as `parts`' own Vec order: `stepcrawl::
+/// group_parts` groups same-shaped parts together (for cutlist/BOM
+/// purposes) regardless of which sub-assembly they live in, so two
+/// instances of the same panel shape in different assemblies can sit
+/// next to each other in `parts` while being nowhere near each other in
+/// the tree. Jump-to-flagged (`next_flagged`/`prev_flagged` in `mod.rs`)
+/// walks *this* order, not `parts`' raw index order, so it moves you
+/// through what you're browsing rather than jumping to an unrelated
+/// same-shaped part elsewhere in the model.
+pub(super) fn depth_first_part_order(parts: &[Part]) -> Vec<usize> {
+    let (order, children) = build_nodes(parts);
+    let mut out = Vec::with_capacity(parts.len());
+    collect_depth_first(&order, &children, &mut out);
+    out
+}
+
+fn collect_depth_first(order: &[String], children: &HashMap<String, Node>, out: &mut Vec<usize>) {
+    for name in order {
+        match &children[name] {
+            Node::Leaf { part_index } => out.push(*part_index),
+            Node::Folder {
+                order: sub_order,
+                children: sub_children,
+            } => collect_depth_first(sub_order, sub_children, out),
+        }
+    }
 }
 
 /// Column header for the leaf rows, aligned field-for-field with
-/// `leaf_line` -- the tree widget has no header row of its own, so this
-/// is rendered as a fixed line above it (see `ui::draw_tree`).
+/// `leaf_line` -- this is a plain `Paragraph` drawn above the row list
+/// (see `ui::draw_assembly_list`), not part of the list widget itself.
 pub(super) fn header_line() -> Line<'static> {
     let header_style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
-    let pad = " ".repeat(NAME_COLUMN_START);
+    let pad = " ".repeat(ROW_PREFIX_WIDTH);
     let left = format!("{pad}{:<NAME_FIELD_WIDTH$}", "Part");
     let measurements = format!(" {:>9}  {:>9}  {:>8} ", "Length", "Width", "Thick");
     let material = " Material".to_string();
@@ -254,7 +284,7 @@ pub(super) fn header_line() -> Line<'static> {
     ])
 }
 
-fn leaf_line(part: &Part, flagged: bool, depth: usize) -> Line<'static> {
+pub(super) fn leaf_line(part: &Part, flagged: bool) -> Line<'static> {
     let name = part.path.rsplit(" / ").next().unwrap_or(&part.path);
     let marker = if flagged { "! " } else { "  " };
     let material = part
@@ -262,7 +292,7 @@ fn leaf_line(part: &Part, flagged: bool, depth: usize) -> Line<'static> {
         .as_ref()
         .map(|m| m.name.as_str())
         .unwrap_or("-");
-    let left = format!("{}{marker}{name:<NAME_FIELD_WIDTH$}", depth_indent(depth));
+    let left = format!("{marker}{name:<NAME_FIELD_WIDTH$}");
     let measurements = format!(
         " {:>9.4}  {:>9.4}  {:>8.4} ",
         part.length_in, part.width_in, part.thickness_in
@@ -282,35 +312,34 @@ fn leaf_line(part: &Part, flagged: bool, depth: usize) -> Line<'static> {
     ])
 }
 
-/// Folders get their own bold accent color so the tree's shape reads at
-/// a glance the same way a directory listing's does -- yellow rather
-/// than LSCOLORS' traditional blue, which reads poorly against this
-/// user's One Dark terminal theme. The `(N !)` flagged-descendant count
-/// stays red regardless -- a warning needs to stay a warning color, not
-/// blend into the folder's own.
-///
-/// Unlike `leaf_line`, a folder doesn't get the depth-compensating
-/// indent or the vertical rule: it carries no data-column content to
-/// separate from, and forcing every folder's name out to the same fixed
-/// column leaf rows use would push shallow, top-level folders across
-/// most of the screen for no reason. Folders just sit at their own
-/// natural, tree-shaped indent, the same as any other tree/file browser.
-fn folder_line(name: &str, flagged: usize) -> Line<'static> {
+/// Folders get their own bold accent color so the assembly list's shape
+/// reads at a glance the same way a directory listing's does -- yellow
+/// rather than LSCOLORS' traditional blue, which reads poorly against
+/// this user's One Dark terminal theme. The `(N !)` flagged-descendant
+/// count stays red regardless -- a warning needs to stay a warning
+/// color, not blend into the folder's own. Padded by the same
+/// `ROW_PREFIX_WIDTH` a leaf's flag marker takes, so folder and leaf
+/// names in the same list start in the same screen column.
+pub(super) fn folder_line(name: &str, flagged: usize) -> Line<'static> {
     let folder_style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let pad = " ".repeat(ROW_PREFIX_WIDTH);
     if flagged > 0 {
         Line::from(vec![
+            Span::raw(pad),
             Span::styled(name.to_string(), folder_style),
             Span::styled(format!("  ({flagged} !)"), Style::new().fg(Color::Red)),
         ])
     } else {
-        Line::from(Span::styled(name.to_string(), folder_style))
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled(name.to_string(), folder_style),
+        ])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn material(name: &str, thickness_in: f64) -> Material {
         Material {
@@ -341,85 +370,164 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_maps_each_leaf_identifier_to_its_part_index() {
-        let parts = vec![part("Bench / Top"), part("Bench / Leg")];
-        let (items, index) = build(&parts, &[]);
-
-        assert_eq!(
-            items.len(),
-            1,
-            "both parts share one top-level folder, Bench"
-        );
-        assert_eq!(index.len(), 2);
-        assert_eq!(index["Bench / Top"], 0);
-        assert_eq!(index["Bench / Leg"], 1);
+    fn row_names(rows: &[Row]) -> Vec<&str> {
+        rows.iter().map(|r| r.name.as_str()).collect()
     }
 
     #[test]
-    fn build_disambiguates_a_colliding_leaf_name_with_a_suffix() {
-        // Two parts sharing a bare (folder-less) name would otherwise
-        // collide on the same tree identifier -- see `insert`'s docs.
-        let parts = vec![part("Body"), part("Body")];
-        let (_items, index) = build(&parts, &[]);
-
-        assert_eq!(index.get("Body"), Some(&0));
-        assert_eq!(
-            index.get("Body (2)"),
-            Some(&1),
-            "second collision should get a ` (2)` suffix, not silently drop"
-        );
-    }
-
-    #[test]
-    fn build_disambiguates_three_colliding_leaf_names_in_order() {
+    fn rows_at_root_lists_direct_children_only() {
         let parts = vec![
-            part("Bench / Body"),
-            part("Bench / Body"),
-            part("Bench / Body"),
+            part("Carcasses / Carcass A / Body"),
+            part("Doors / Door A / Body"),
         ];
-        let (_items, index) = build(&parts, &[]);
-
-        assert_eq!(index.get("Bench / Body"), Some(&0));
-        assert_eq!(index.get("Bench / Body (2)"), Some(&1));
-        assert_eq!(index.get("Bench / Body (3)"), Some(&2));
+        let rows = rows_at(&parts, &[], &[]).expect("root always resolves");
+        assert_eq!(row_names(&rows), vec!["Carcasses", "Doors"]);
+        for row in &rows {
+            assert!(
+                matches!(row.kind, RowKind::Folder { flagged: 1 }),
+                "each top-level assembly has exactly one unresolved part beneath it"
+            );
+        }
     }
 
     #[test]
-    fn all_folder_paths_lists_every_folder_at_every_depth() {
+    fn rows_at_nested_path_lists_that_assemblys_direct_children() {
         let parts = vec![
-            part("Bench / Carcasses / Carcass A / Body"),
-            part("Bench / Doors / Door A / Body"),
+            part("Carcasses / Carcass A / Body"),
+            part("Carcasses / Carcass A / Side"),
+            part("Carcasses / Carcass B / Body"),
         ];
-        let paths: HashSet<Vec<String>> = all_folder_paths(&parts).into_iter().collect();
+        let path = vec!["Carcasses".to_string()];
+        let rows = rows_at(&parts, &[], &path).unwrap();
+        assert_eq!(row_names(&rows), vec!["Carcass A", "Carcass B"]);
 
-        let expected: HashSet<Vec<String>> = [
-            vec!["Bench".to_string()],
-            vec!["Bench".to_string(), "Carcasses".to_string()],
+        let path = vec!["Carcasses".to_string(), "Carcass A".to_string()];
+        let rows = rows_at(&parts, &[], &path).unwrap();
+        assert_eq!(row_names(&rows), vec!["Body", "Side"]);
+        assert!(rows
+            .iter()
+            .all(|r| matches!(r.kind, RowKind::Leaf { flagged: true, .. })));
+    }
+
+    #[test]
+    fn rows_at_root_accepts_bare_leaves_alongside_folders() {
+        let parts = vec![part("Standalone Jig"), part("Carcasses / Carcass A / Body")];
+        let rows = rows_at(&parts, &[], &[]).unwrap();
+        assert_eq!(row_names(&rows), vec!["Standalone Jig", "Carcasses"]);
+        assert!(matches!(rows[0].kind, RowKind::Leaf { part_index: 0, .. }));
+    }
+
+    #[test]
+    fn rows_at_returns_none_through_a_leaf() {
+        let parts = vec![part("Body")];
+        let path = vec!["Body".to_string(), "Anything".to_string()];
+        assert!(rows_at(&parts, &[], &path).is_none());
+    }
+
+    #[test]
+    fn rows_at_returns_none_for_an_unknown_path() {
+        let parts = vec![part("Carcasses / Carcass A / Body")];
+        let path = vec!["Doors".to_string()];
+        assert!(rows_at(&parts, &[], &path).is_none());
+    }
+
+    #[test]
+    fn rows_at_reflects_resolved_parts_in_flagged_counts() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let mut parts = vec![
+            part("Carcasses / Carcass A / Flagged"),
+            part("Carcasses / Carcass A / Resolved"),
+        ];
+        parts[1].material = Some(material("Baltic Birch 3/4", 0.75));
+
+        let path = vec!["Carcasses".to_string()];
+        let rows = rows_at(&parts, &materials, &path).unwrap();
+        assert!(matches!(rows[0].kind, RowKind::Folder { flagged: 1 }));
+
+        let rows = rows_at(&parts, &materials, &[]).unwrap();
+        assert!(matches!(rows[0].kind, RowKind::Folder { flagged: 1 }));
+    }
+
+    #[test]
+    fn locate_part_finds_a_top_level_leaf() {
+        let parts = vec![part("Body")];
+        assert_eq!(locate_part(&parts, 0), vec!["Body".to_string()]);
+    }
+
+    #[test]
+    fn locate_part_finds_a_nested_leaf() {
+        let parts = vec![part("Carcasses / Carcass A / Body")];
+        assert_eq!(
+            locate_part(&parts, 0),
             vec![
-                "Bench".to_string(),
                 "Carcasses".to_string(),
                 "Carcass A".to_string(),
-            ],
-            vec!["Bench".to_string(), "Doors".to_string()],
-            vec![
-                "Bench".to_string(),
-                "Doors".to_string(),
-                "Door A".to_string(),
-            ],
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(
-            paths, expected,
-            "leaf names (Body) must never appear as folder paths"
+                "Body".to_string()
+            ]
         );
     }
 
     #[test]
-    fn all_folder_paths_is_empty_for_a_flat_tree_of_bare_leaves() {
-        let parts = vec![part("Body A"), part("Body B")];
-        assert!(all_folder_paths(&parts).is_empty());
+    fn locate_part_finds_disambiguated_colliding_siblings() {
+        let parts = vec![
+            part("Bench / Body"),
+            part("Bench / Body"),
+            part("Bench / Body"),
+        ];
+        assert_eq!(
+            locate_part(&parts, 1),
+            vec!["Bench".to_string(), "Body (2)".to_string()]
+        );
+        assert_eq!(
+            locate_part(&parts, 2),
+            vec!["Bench".to_string(), "Body (3)".to_string()]
+        );
+    }
+
+    #[test]
+    fn depth_first_part_order_follows_the_tree_not_the_parts_vec() {
+        // Mirrors what `stepcrawl::group_parts` actually produces: same-
+        // shaped parts across sibling assemblies land next to each other
+        // in `Part`'s own Vec order (index 0 and 2 here are both
+        // "Backer", from different carcasses), interleaved with an
+        // unrelated part from the assembly in between (index 1). Tree
+        // order must still walk Left's own parts before moving on to
+        // Middle's, regardless of that interleaving.
+        let parts = vec![
+            part("Carcasses / Left / Backer"),   // 0
+            part("Carcasses / Left / Panel"),    // 1
+            part("Carcasses / Middle / Backer"), // 2
+            part("Carcasses / Middle / Panel"),  // 3
+        ];
+        assert_eq!(depth_first_part_order(&parts), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn navigate_to_part_round_trips_to_a_nested_part() {
+        let parts = vec![
+            part("Carcasses / Carcass A / Body"),
+            part("Carcasses / Carcass A / Side"),
+            part("Doors / Door A / Body"),
+        ];
+        let (breadcrumb, row_index) = navigate_to_part(&parts, &[], 1);
+        assert_eq!(
+            breadcrumb,
+            vec!["Carcasses".to_string(), "Carcass A".to_string()]
+        );
+        let rows = rows_at(&parts, &[], &breadcrumb).unwrap();
+        assert!(matches!(
+            rows[row_index].kind,
+            RowKind::Leaf { part_index: 1, .. }
+        ));
+        assert_eq!(rows[row_index].name, "Side");
+    }
+
+    #[test]
+    fn navigate_to_part_round_trips_to_a_root_level_part() {
+        let parts = vec![part("Standalone Jig")];
+        let (breadcrumb, row_index) = navigate_to_part(&parts, &[], 0);
+        assert!(breadcrumb.is_empty());
+        assert_eq!(row_index, 0);
     }
 
     #[test]

@@ -1,7 +1,8 @@
-//! `storystick`: an in-terminal tree over a project's STEP export --
-//! flag rows that need attention, assign materials, save state back to
+//! `storystick`: an in-terminal browser over a project's STEP export --
+//! drill into the assembly hierarchy one level at a time, flag rows that
+//! need attention, assign materials, save state back to
 //! `storystick.yaml`, and generate the section-grouped cutlist PDF from
-//! the tree's current state, all without switching to another program.
+//! the current state, all without switching to another program.
 //!
 //! Geometry always comes fresh from the STEP file (see `load_parts`);
 //! everything else that persists between runs -- which materials this
@@ -13,11 +14,12 @@
 //! its own exception (`crate::project::Project::assignments`), if it has
 //! one; else whichever of its bracket tags has a rule
 //! (`crate::project::Project::autofill`); else unassigned, flagged.
-//! Bulk-edit (`b`) is the primary way a rule gets authored -- it writes
-//! *one* rule, applied fresh to every currently-matching part that has no
-//! exception of its own, and re-applied automatically to any part a
-//! future STEP revision adds with the same tag. The single-part picker
-//! (`m`) instead carves out an exception for just the selected part;
+//! Bulk-edit (`<space>b`) is the primary way a rule gets authored -- it
+//! writes *one* rule, applied fresh to every currently-matching part that
+//! has no exception of its own, and re-applied automatically to any part
+//! a future STEP revision adds with the same tag. `Enter` on a single
+//! part instead opens that part's own edit modal (`PartEditState`),
+//! whose Material field carves out an exception for just that part;
 //! clearing that exception removes it outright and re-resolves the part
 //! from whatever rule currently applies (or plain unassigned, if none
 //! does) -- there's no third "explicitly no material" state to hold in
@@ -25,12 +27,21 @@
 //!
 //! Grain always runs with a part's length. stepcrawl's own length/width
 //! guess (longer of the two in-plane dimensions is length) is often
-//! exactly what you want, but not always -- `g` swaps a part's
-//! length/width when it isn't, rather than exposing a separate "grain"
-//! concept: there was never an independent capability there to preserve
-//! (packing has only ever cared about which dimension is called length),
-//! so a second concept meaning the same thing was just something else to
-//! learn.
+//! exactly what you want, but not always -- the edit modal's Grain field
+//! swaps a part's length/width when it isn't, rather than exposing a
+//! separate "grain" concept: there was never an independent capability
+//! there to preserve (packing has only ever cared about which dimension
+//! is called length), so a second concept meaning the same thing was
+//! just something else to learn.
+//!
+//! Keys split into pure movement (bare keys: `hjkl`, `gg`/`G`, `/`, `]f`/
+//! `[f`, `n`/`N`) and commands, which live behind a leader key (bare
+//! `space`, then one more letter) or the `ctrl+p` command palette -- both
+//! dispatch through the same `Command` registry, so there's exactly one
+//! place that knows what a command does. Save and quit (`w`/`q`) and the
+//! full keybinding reference (`?`, see `ui::draw_help_screen`) sit
+//! outside this split entirely, as bare top-level app control -- see
+//! `Command`'s own doc comment for why `w` doesn't belong in it.
 
 mod tree;
 mod ui;
@@ -39,6 +50,8 @@ use crate::assignments::PartOverride;
 use crate::project::Project;
 use crate::{autofill, round4, stock, MM_PER_IN};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
 use std::error::Error;
@@ -47,7 +60,6 @@ use std::time::{Duration, Instant};
 use storystick_core::nesting::{pack, Material, PackablePart, StockSheet};
 use storystick_core::stepcrawl::{extract_parts, relabel_with_known_thickness};
 use storystick_core::tags;
-use tui_tree_widget::TreeState;
 
 /// How far a part's own measured thickness may sit from a candidate
 /// material's nominal thickness and still be offered in the picker (or
@@ -66,8 +78,8 @@ const COMPATIBLE_THICKNESS_TOLERANCE_IN: f64 = 0.06;
 /// error, "set material for ...") stays on screen before it's replaced
 /// with the resting keyboard-shortcut help text -- long enough to read,
 /// short enough that the help line (the thing you actually want visible
-/// most of the time, especially right after `s`) comes back on its own
-/// rather than staying clobbered until the next action happens to
+/// most of the time, especially right after saving) comes back on its
+/// own rather than staying clobbered until the next action happens to
 /// overwrite it.
 const STATUS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -355,6 +367,16 @@ pub(crate) fn part_flag(part: &Part, materials: &[Material]) -> Option<&'static 
     None
 }
 
+/// Whether every part in the project is resolved -- no `part_flag`
+/// reason left standing on any of them. `App::print` refuses to build a
+/// cutlist/BOM unless this holds: printing against an unresolved part is
+/// exactly the "hidden stretcher on show-face plywood" mistake a named
+/// assignment exists to prevent (see `part_flag`), not a decision the
+/// packer should ever get to make silently on a part's behalf.
+fn all_parts_resolved(parts: &[Part], materials: &[Material]) -> bool {
+    parts.iter().all(|p| part_flag(p, materials).is_none())
+}
+
 fn load_parts(
     step_path: &Path,
     project: &Project,
@@ -402,6 +424,76 @@ fn load_parts(
         }
     }
     Ok(parts)
+}
+
+/// Ranks `candidates` against `query` by fuzzy match quality, best first,
+/// returning their original indices -- never the strings themselves, so
+/// the same function serves both the project-wide `/` part-name search
+/// and the `ctrl+p` command palette without either caller needing to
+/// re-associate a ranked string back to what it came from. An empty
+/// query matches everything, in its original order, rather than nothing
+/// -- that's what makes opening `/` or the palette with no query yet
+/// typed show the full list instead of an empty one.
+fn fuzzy_rank(query: &str, candidates: &[&str]) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..candidates.len()).collect();
+    }
+    let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let mut buf = Vec::new();
+    let mut scored: Vec<(usize, u32)> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, candidate)| {
+            pattern
+                .score(Utf32Str::new(candidate, &mut buf), &mut matcher)
+                .map(|score| (i, score))
+        })
+        .collect();
+    scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+    scored.into_iter().map(|(i, _)| i).collect()
+}
+
+/// The next flagged part after `from` in `order` (see `tree::
+/// depth_first_part_order` -- the tree/display order, not `parts`' own
+/// Vec order, which `stepcrawl::group_parts` groups by shape rather than
+/// by assembly), wrapping around the end. Returns `from` itself if it's
+/// the only flagged part left. `from` not appearing in `order` is
+/// treated as "start of the list" -- it can't happen in practice (`order`
+/// always covers every part), but this keeps the function total rather
+/// than panicking on a bad index.
+fn next_flagged(
+    parts: &[Part],
+    materials: &[Material],
+    order: &[usize],
+    from: usize,
+) -> Option<usize> {
+    let n = order.len();
+    if n == 0 {
+        return None;
+    }
+    let pos = order.iter().position(|&i| i == from).unwrap_or(0);
+    (1..=n)
+        .map(|offset| order[(pos + offset) % n])
+        .find(|&i| part_flag(&parts[i], materials).is_some())
+}
+
+/// The previous flagged part before `from` in `order` -- the ctrl+u
+/// counterpart to `next_flagged`.
+fn prev_flagged(
+    parts: &[Part],
+    materials: &[Material],
+    order: &[usize],
+    from: usize,
+) -> Option<usize> {
+    let n = order.len();
+    if n == 0 {
+        return None;
+    }
+    let pos = order.iter().position(|&i| i == from).unwrap_or(0);
+    (1..=n)
+        .map(|offset| order[(pos + n - offset) % n])
+        .find(|&i| part_flag(&parts[i], materials).is_some())
 }
 
 /// What a confirmed `PickerState` choice applies to -- a single selected
@@ -453,14 +545,109 @@ pub(crate) struct PrintSettings {
     trim_touched: bool,
 }
 
+/// A part's two editable fields -- material and grain -- edited together
+/// on one screen (`PartEditState`) rather than as separate top-level
+/// commands. These are, deliberately, the *only* two: geometry is never
+/// editable in storystick (Shapr3D is the source of truth), and the only
+/// other per-part flag (`Part::unreliable`) is a read-only import-time
+/// diagnostic, not a decision to record here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartEditField {
+    Material,
+    Grain,
+}
+
+pub(crate) struct PartEditState {
+    pub(crate) part_index: usize,
+    pub(crate) focus: PartEditField,
+}
+
+/// Every command reachable via the leader key (bare `space`, then a
+/// letter) or the `ctrl+p` palette -- one registry, two entry points, so
+/// there's exactly one place that knows what a command does and how to
+/// spell it. Material and grain are deliberately *not* here: they're
+/// per-part fields edited via `PartEditState`, reached through `Enter`,
+/// not stand-alone commands. Save isn't here either, despite being just
+/// as much a "command" conceptually -- it's frequent and universally
+/// safe enough (like quit) to earn its own bare top-level key (`w`,
+/// mirroring vim's `:w`) rather than sitting behind the leader.
+#[derive(Clone, Copy)]
+pub(crate) enum Command {
+    BulkEdit,
+    PrintSettings,
+}
+
+impl Command {
+    pub(crate) fn all() -> &'static [Command] {
+        &[Command::BulkEdit, Command::PrintSettings]
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Command::BulkEdit => "bulk edit",
+            Command::PrintSettings => "print settings",
+        }
+    }
+
+    fn leader_key(&self) -> char {
+        match self {
+            Command::BulkEdit => 'b',
+            Command::PrintSettings => 'p',
+        }
+    }
+}
+
+/// A bare key that swallows exactly one more keypress before it means
+/// anything -- `g` (half of `gg`, jump to top), `space` (the leader,
+/// followed by a command's letter), and `]`/`[` (half of `]f`/`[f`, jump
+/// to the next/previous flagged part) all work this way, and are
+/// consolidated into one enum rather than independent booleans that
+/// could drift out of sync with each other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingKey {
+    None,
+    G,
+    Leader,
+    BracketNext,
+    BracketPrev,
+}
+
+/// What `n`/`N` repeat: either a `/` fuzzy name search or a `]f`/`[f`
+/// flagged-part jump, whichever was performed most recently -- mirroring
+/// real vim, where `n`/`N` repeat the last search regardless of whether
+/// it was started with `/`, `*`, or `#`. `matches` holds part indices in
+/// the order this jump's own kind defines; `query` stays empty for a
+/// `]f`/`[f`-seeded jump, since nothing was typed. `editing` is true only
+/// while `/`'s own input line is on screen; once `Enter` confirms it (or
+/// a `]f`/`[f` jump lands directly) it's false, but `matches`/`current`
+/// stay alive so `n`/`N` keep cycling either kind without reopening `/`.
+pub(crate) struct JumpState {
+    pub(crate) query: String,
+    pub(crate) matches: Vec<usize>,
+    pub(crate) current: usize,
+    pub(crate) editing: bool,
+}
+
+/// The `ctrl+p` command palette's own state -- `matches` holds indices
+/// into `Command::all()`, ranked by `fuzzy_rank` against each command's
+/// label.
+pub(crate) struct PaletteState {
+    pub(crate) query: String,
+    pub(crate) matches: Vec<usize>,
+    pub(crate) selected: usize,
+}
+
 pub(crate) struct App {
     pub(crate) parts: Vec<Part>,
-    /// Maps a tree node's identifier path (as `tree_state.selected()`
-    /// joins it) to its part index -- rebuilt every draw alongside the
-    /// tree itself (see `ui::draw_tree`), since a leaf's identifier can
-    /// differ from `Part::path` when `tree::build` had to disambiguate a
-    /// same-named sibling (see `tree::insert`).
-    pub(crate) selection_index: HashMap<String, usize>,
+    /// The assembly currently being browsed, as a path of folder names
+    /// from the project root -- empty means the root itself. Every
+    /// folder in the underlying tree is an assembly; a part with no
+    /// children is just a trivial one-part assembly, so there's no
+    /// separate concept to track for it. See `tree::rows_at`.
+    pub(crate) breadcrumb: Vec<String>,
+    /// Selection within the *current* assembly's row list (`App::
+    /// current_rows`) -- reset to the top whenever `breadcrumb` changes.
+    pub(crate) list_state: ListState,
     /// This project's own material subset, resolved against the global
     /// catalog (see `Project::resolve_materials`) -- what the pickers
     /// offer, never the whole shop catalog.
@@ -468,7 +655,6 @@ pub(crate) struct App {
     /// This project's own stock subset (see `Project::resolve_stock`) --
     /// what `pack()` is allowed to nest onto.
     stock: Vec<StockSheet>,
-    pub(crate) tree_state: TreeState<String>,
     pub(crate) dirty: bool,
     pub(crate) status: String,
     /// The keyboard-shortcut help line `status` reverts to once a
@@ -482,15 +668,21 @@ pub(crate) struct App {
     pub(crate) picker: Option<PickerState>,
     pub(crate) bulk: Option<BulkState>,
     pub(crate) print_settings: Option<PrintSettings>,
+    pub(crate) part_edit: Option<PartEditState>,
+    pub(crate) palette: Option<PaletteState>,
+    pub(crate) jump: Option<JumpState>,
+    /// Set by a bare `g`, `space`, `]`, or `[`, consumed by the very next
+    /// keypress (see `run`'s main-mode dispatch) -- see `PendingKey`.
+    pending_key: PendingKey,
     /// True while the "save before exiting?" popup is up -- set when `q`
     /// or `Esc` is pressed with `dirty` still true, instead of quitting
     /// immediately, so an unsaved swap, exception, or rule change from
     /// earlier in the session can't be lost to a reflexive quit keypress.
     pub(crate) confirm_quit: bool,
-    pub(crate) step_path: PathBuf,
+    /// True while the full keybinding reference (bare `?`) is on screen.
+    pub(crate) help_open: bool,
     project: Project,
     project_path: PathBuf,
-    pub(crate) last_tree_height: u16,
 }
 
 impl App {
@@ -543,25 +735,190 @@ impl App {
         (resolved, self.parts.len())
     }
 
+    /// The current assembly's direct children -- see `tree::rows_at`.
+    /// Rebuilt on demand rather than cached, the same way the old
+    /// whole-tree view was rebuilt on every draw.
+    fn current_rows(&self) -> Vec<tree::Row> {
+        tree::rows_at(&self.parts, &self.materials, &self.breadcrumb)
+            .expect("breadcrumb only ever holds paths this session's own navigation produced")
+    }
+
+    /// The part index behind the currently selected row, or `None` if
+    /// nothing's selected or the selection is a sub-assembly rather than
+    /// a part.
     fn selected_part_index(&self) -> Option<usize> {
-        let selected = self.tree_state.selected();
-        if selected.is_empty() {
-            return None;
-        }
-        self.selection_index.get(&selected.join(" / ")).copied()
-    }
-
-    fn expand_all(&mut self) {
-        for path in tree::all_folder_paths(&self.parts) {
-            self.tree_state.open(path);
+        let rows = self.current_rows();
+        let i = self.list_state.selected()?;
+        match rows.get(i)?.kind {
+            tree::RowKind::Leaf { part_index, .. } => Some(part_index),
+            tree::RowKind::Folder { .. } => None,
         }
     }
 
+    fn select_up(&mut self) {
+        let len = self.current_rows().len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.list_state.selected().unwrap_or(0) as i64;
+        let next = (cur - 1).rem_euclid(len as i64) as usize;
+        self.list_state.select(Some(next));
+    }
+
+    fn select_down(&mut self) {
+        let len = self.current_rows().len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.list_state.selected().unwrap_or(0) + 1) % len;
+        self.list_state.select(Some(next));
+    }
+
+    fn select_top(&mut self) {
+        if !self.current_rows().is_empty() {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    fn select_bottom(&mut self) {
+        let len = self.current_rows().len();
+        if len > 0 {
+            self.list_state.select(Some(len - 1));
+        }
+    }
+
+    /// `l`/Right on a sub-assembly descends into it; on a part, or with
+    /// nothing selected, this is a no-op (opening a part is `Enter`'s
+    /// job, via `handle_enter`, not this one's).
+    fn drill_in(&mut self) {
+        let rows = self.current_rows();
+        let Some(i) = self.list_state.selected() else {
+            return;
+        };
+        if let Some(tree::Row {
+            name,
+            kind: tree::RowKind::Folder { .. },
+        }) = rows.get(i)
+        {
+            self.breadcrumb.push(name.clone());
+            self.list_state.select(Some(0));
+        }
+    }
+
+    /// `h`/Left backs out of the current assembly to its parent -- a
+    /// no-op at the project root.
+    fn go_up(&mut self) {
+        if self.breadcrumb.pop().is_some() {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    /// `Enter`: open the selected part's edit modal, or descend into the
+    /// selected sub-assembly -- whichever the current row actually is.
     fn handle_enter(&mut self) {
-        if self.selected_part_index().is_some() {
-            self.open_picker();
-        } else {
-            self.tree_state.toggle_selected();
+        match self.selected_part_index() {
+            Some(i) => self.open_part_edit(i),
+            None => self.drill_in(),
+        }
+    }
+
+    /// Moves the breadcrumb/selection to show `part_index`, wherever in
+    /// the tree it lives -- the one chokepoint both a `]f`/`[f`
+    /// flagged-jump and fuzzy-jump-by-name (`/`) land through.
+    fn navigate_to_part(&mut self, part_index: usize) {
+        let (breadcrumb, row_index) =
+            tree::navigate_to_part(&self.parts, &self.materials, part_index);
+        self.breadcrumb = breadcrumb;
+        self.list_state.select(Some(row_index));
+    }
+
+    /// Every flagged part, in tree order -- the list a `]f`/`[f` jump
+    /// seeds into `App.jump` so a following `n`/`N` keeps cycling it.
+    fn flagged_parts_in_tree_order(&self) -> Vec<usize> {
+        tree::depth_first_part_order(&self.parts)
+            .into_iter()
+            .filter(|&i| part_flag(&self.parts[i], &self.materials).is_some())
+            .collect()
+    }
+
+    /// Points `App.jump` at `target` within `matches` and navigates to it
+    /// -- the shared landing point for both `]f`/`[f` (matches = every
+    /// flagged part) and a confirmed `/` search (matches = the ranked
+    /// name matches), so `n`/`N` afterward don't need to know which kind
+    /// of jump they're continuing.
+    fn start_jump_at(&mut self, target: usize, matches: Vec<usize>) {
+        let current = matches.iter().position(|&i| i == target).unwrap_or(0);
+        self.jump = Some(JumpState {
+            query: String::new(),
+            matches,
+            current,
+            editing: false,
+        });
+        self.navigate_to_part(target);
+    }
+
+    fn jump_to_next_flagged(&mut self) {
+        if self.parts.is_empty() {
+            self.set_status("no parts to jump to");
+            return;
+        }
+        let order = tree::depth_first_part_order(&self.parts);
+        let from = self.selected_part_index().unwrap_or(0);
+        match next_flagged(&self.parts, &self.materials, &order, from) {
+            Some(target) => {
+                let matches = self.flagged_parts_in_tree_order();
+                self.start_jump_at(target, matches);
+            }
+            None => self.set_status("no flagged parts remaining"),
+        }
+    }
+
+    fn jump_to_prev_flagged(&mut self) {
+        if self.parts.is_empty() {
+            self.set_status("no parts to jump to");
+            return;
+        }
+        let order = tree::depth_first_part_order(&self.parts);
+        let from = self.selected_part_index().unwrap_or(0);
+        match prev_flagged(&self.parts, &self.materials, &order, from) {
+            Some(target) => {
+                let matches = self.flagged_parts_in_tree_order();
+                self.start_jump_at(target, matches);
+            }
+            None => self.set_status("no flagged parts remaining"),
+        }
+    }
+
+    fn open_part_edit(&mut self, part_index: usize) {
+        self.part_edit = Some(PartEditState {
+            part_index,
+            focus: PartEditField::Material,
+        });
+    }
+
+    fn part_edit_toggle_focus(&mut self) {
+        let Some(pe) = &mut self.part_edit else {
+            return;
+        };
+        pe.focus = match pe.focus {
+            PartEditField::Material => PartEditField::Grain,
+            PartEditField::Grain => PartEditField::Material,
+        };
+    }
+
+    /// Acts on the part-edit modal's focused field -- Material opens the
+    /// existing material picker (`open_picker`, unchanged: it already
+    /// resolves the target part from `selected_part_index`, which still
+    /// points at the right part while this modal has focus) and Grain
+    /// toggles the swap directly (`toggle_swap`, also unchanged). Only
+    /// the entry point moved; neither of these was rewritten.
+    fn confirm_part_edit_field(&mut self) {
+        let Some(pe) = &self.part_edit else {
+            return;
+        };
+        match pe.focus {
+            PartEditField::Material => self.open_picker(),
+            PartEditField::Grain => self.toggle_swap(),
         }
     }
 
@@ -838,6 +1195,14 @@ impl App {
     }
 
     fn print(&mut self) {
+        if !all_parts_resolved(&self.parts, &self.materials) {
+            let (resolved, total) = self.resolved_counts();
+            self.set_status(format!(
+                "{} of {total} part(s) still unresolved -- assign every part before printing",
+                total - resolved
+            ));
+            return;
+        }
         let parts: Vec<PackablePart> = self.parts.iter().map(Part::to_packable).collect();
         let trim_allowance_mm = self.project.settings.trim_allowance_in * MM_PER_IN;
         let layout = pack(
@@ -875,6 +1240,157 @@ impl App {
             Err(e) => self.set_status(format!("failed to write {}: {e}", out_path.display())),
         }
     }
+
+    fn run_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::BulkEdit => self.open_bulk_edit(),
+            Command::PrintSettings => self.open_print_settings(),
+        }
+    }
+
+    fn open_palette(&mut self) {
+        let matches = (0..Command::all().len()).collect();
+        self.palette = Some(PaletteState {
+            query: String::new(),
+            matches,
+            selected: 0,
+        });
+    }
+
+    fn recompute_palette(&mut self) {
+        let labels: Vec<&str> = Command::all().iter().map(Command::label).collect();
+        let Some(p) = &mut self.palette else {
+            return;
+        };
+        p.matches = fuzzy_rank(&p.query, &labels);
+        p.selected = 0;
+    }
+
+    fn palette_input(&mut self, c: char) {
+        let Some(p) = &mut self.palette else {
+            return;
+        };
+        p.query.push(c);
+        self.recompute_palette();
+    }
+
+    fn palette_backspace(&mut self) {
+        let Some(p) = &mut self.palette else {
+            return;
+        };
+        p.query.pop();
+        self.recompute_palette();
+    }
+
+    fn palette_move(&mut self, delta: i64) {
+        let Some(p) = &mut self.palette else {
+            return;
+        };
+        if p.matches.is_empty() {
+            return;
+        }
+        let len = p.matches.len() as i64;
+        let cur = p.selected as i64;
+        p.selected = (cur + delta).rem_euclid(len) as usize;
+    }
+
+    fn confirm_palette(&mut self) {
+        let cmd = match &self.palette {
+            Some(p) => p.matches.get(p.selected).map(|&i| Command::all()[i]),
+            None => None,
+        };
+        self.palette = None;
+        if let Some(cmd) = cmd {
+            self.run_command(cmd);
+        }
+    }
+
+    /// Opens `/`'s own input line, seeding `matches` with every part (in
+    /// its existing order) so an empty query shows something rather than
+    /// nothing before the first keystroke.
+    fn open_name_jump(&mut self) {
+        self.jump = Some(JumpState {
+            query: String::new(),
+            matches: (0..self.parts.len()).collect(),
+            current: 0,
+            editing: true,
+        });
+    }
+
+    fn recompute_name_jump(&mut self) {
+        let paths: Vec<&str> = self.parts.iter().map(|p| p.path.as_str()).collect();
+        let Some(j) = &mut self.jump else {
+            return;
+        };
+        j.matches = fuzzy_rank(&j.query, &paths);
+        j.current = 0;
+    }
+
+    fn name_jump_input(&mut self, c: char) {
+        let Some(j) = &mut self.jump else {
+            return;
+        };
+        j.query.push(c);
+        self.recompute_name_jump();
+    }
+
+    fn name_jump_backspace(&mut self) {
+        let Some(j) = &mut self.jump else {
+            return;
+        };
+        j.query.pop();
+        self.recompute_name_jump();
+    }
+
+    fn confirm_name_jump(&mut self) {
+        let target = match &mut self.jump {
+            Some(j) => {
+                j.editing = false;
+                j.matches.first().copied()
+            }
+            None => None,
+        };
+        match target {
+            Some(target) => self.navigate_to_part(target),
+            None => {
+                self.set_status("no matching part");
+                self.jump = None;
+            }
+        }
+    }
+
+    fn cancel_name_jump(&mut self) {
+        self.jump = None;
+    }
+
+    /// `n`: repeats whichever jump (`/` name search or `]f`/`[f`
+    /// flagged-jump) was performed most recently -- see `JumpState`.
+    fn jump_next(&mut self) {
+        let target = match &mut self.jump {
+            Some(j) if !j.matches.is_empty() => {
+                j.current = (j.current + 1) % j.matches.len();
+                Some(j.matches[j.current])
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
+            self.navigate_to_part(target);
+        }
+    }
+
+    /// `N`: the reverse of `jump_next`.
+    fn jump_prev(&mut self) {
+        let target = match &mut self.jump {
+            Some(j) if !j.matches.is_empty() => {
+                j.current = (j.current + j.matches.len() - 1) % j.matches.len();
+                Some(j.matches[j.current])
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
+            self.navigate_to_part(target);
+        }
+    }
 }
 
 pub(crate) fn run(
@@ -890,15 +1406,16 @@ pub(crate) fn run(
 
     let parts = load_parts(&step_path, &project, &materials)?;
 
-    let tree_state = TreeState::default();
+    let mut list_state = ListState::default();
+    list_state.select(Some(0));
 
     let help_text = ui::tree_help_text();
     let mut app = App {
         parts,
-        selection_index: HashMap::new(),
+        breadcrumb: Vec::new(),
+        list_state,
         materials,
         stock: stock_subset,
-        tree_state,
         dirty: false,
         status: help_text.clone(),
         default_status: help_text,
@@ -906,27 +1423,19 @@ pub(crate) fn run(
         picker: None,
         bulk: None,
         print_settings: None,
+        part_edit: None,
+        palette: None,
+        jump: None,
+        pending_key: PendingKey::None,
         confirm_quit: false,
-        step_path,
+        help_open: false,
         project,
         project_path,
-        last_tree_height: 20,
     };
 
     ratatui::run(|terminal| -> Result<(), Box<dyn Error>> {
-        let mut first_frame = true;
         loop {
             terminal.draw(|frame| ui::draw(frame, &mut app))?;
-            if first_frame {
-                // `select_first` reads a cache the tree only populates once
-                // it's actually been rendered, so this can't happen before
-                // the loop's first `draw` -- redraw once more immediately
-                // so the initial selection is visible without needing a
-                // keypress first.
-                first_frame = false;
-                app.tree_state.select_first();
-                continue;
-            }
 
             // Poll rather than block: a transient status message needs to
             // revert to the help text on its own timeout even if the user
@@ -943,6 +1452,16 @@ pub(crate) fn run(
             }
             app.expire_status();
 
+            // Modal priority, checked in this order every keypress:
+            // picker (can sit on top of bulk-edit *or* the part-edit
+            // modal, since both hand off to it -- see `BulkState` and
+            // `confirm_part_edit_field`), then bulk-edit's own tag list,
+            // then the part-edit modal, then the command palette, then
+            // the `/` filter's own input line (only while `editing`; once
+            // confirmed, `n`/`N` are plain main-mode keys instead), then
+            // print settings, then the quit confirmation. Exactly one of
+            // these should ever be reachable at a time except the two
+            // documented hand-offs to `picker`.
             if app.picker.is_some() {
                 match key.code {
                     KeyCode::Esc => app.picker = None,
@@ -991,6 +1510,52 @@ pub(crate) fn run(
                 continue;
             }
 
+            if app.part_edit.is_some() {
+                match key.code {
+                    KeyCode::Esc => app.part_edit = None,
+                    KeyCode::Tab
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Char('j')
+                    | KeyCode::Char('k') => app.part_edit_toggle_focus(),
+                    KeyCode::Enter => app.confirm_part_edit_field(),
+                    _ => {}
+                }
+                continue;
+            }
+
+            if app.palette.is_some() {
+                match key.code {
+                    KeyCode::Esc => app.palette = None,
+                    KeyCode::Enter => app.confirm_palette(),
+                    KeyCode::Up => app.palette_move(-1),
+                    KeyCode::Down => app.palette_move(1),
+                    KeyCode::Char(c) => app.palette_input(c),
+                    KeyCode::Backspace => app.palette_backspace(),
+                    _ => {}
+                }
+                continue;
+            }
+
+            if matches!(&app.jump, Some(j) if j.editing) {
+                match key.code {
+                    KeyCode::Esc => app.cancel_name_jump(),
+                    KeyCode::Enter => app.confirm_name_jump(),
+                    KeyCode::Char(c) => app.name_jump_input(c),
+                    KeyCode::Backspace => app.name_jump_backspace(),
+                    _ => {}
+                }
+                continue;
+            }
+
+            if app.help_open {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q' | '?') => app.help_open = false,
+                    _ => {}
+                }
+                continue;
+            }
+
             if app.print_settings.is_some() {
                 match key.code {
                     KeyCode::Esc => app.print_settings = None,
@@ -1028,6 +1593,45 @@ pub(crate) fn run(
                 continue;
             }
 
+            // A pending `g` (half of `gg`), leader `space`, or `]`/`[`
+            // (half of `]f`/`[f`) swallows exactly the next keypress. A
+            // key that doesn't complete the sequence clears it and falls
+            // through to the normal dispatch below instead of being
+            // silently eaten -- so `g` then `j` still moves down one row.
+            match app.pending_key {
+                PendingKey::None => {}
+                PendingKey::G => {
+                    app.pending_key = PendingKey::None;
+                    if let KeyCode::Char('g') = key.code {
+                        app.select_top();
+                        continue;
+                    }
+                }
+                PendingKey::Leader => {
+                    app.pending_key = PendingKey::None;
+                    if let KeyCode::Char(c) = key.code {
+                        if let Some(cmd) = Command::all().iter().find(|cmd| cmd.leader_key() == c) {
+                            app.run_command(*cmd);
+                            continue;
+                        }
+                    }
+                }
+                PendingKey::BracketNext => {
+                    app.pending_key = PendingKey::None;
+                    if let KeyCode::Char('f') = key.code {
+                        app.jump_to_next_flagged();
+                        continue;
+                    }
+                }
+                PendingKey::BracketPrev => {
+                    app.pending_key = PendingKey::None;
+                    if let KeyCode::Char('f') = key.code {
+                        app.jump_to_prev_flagged();
+                        continue;
+                    }
+                }
+            }
+
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
@@ -1037,36 +1641,22 @@ pub(crate) fn run(
                         break Ok(());
                     }
                 }
-                KeyCode::Char('d') if ctrl => {
-                    let n = (app.last_tree_height / 2).max(1) as usize;
-                    app.tree_state.scroll_down(n);
-                }
-                KeyCode::Char('u') if ctrl => {
-                    let n = (app.last_tree_height / 2).max(1) as usize;
-                    app.tree_state.scroll_up(n);
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.tree_state.key_up();
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    app.tree_state.key_down();
-                }
-                KeyCode::Left | KeyCode::Char('h') => {
-                    app.tree_state.key_left();
-                }
-                KeyCode::Right | KeyCode::Char('l') => {
-                    app.tree_state.key_right();
-                }
-                KeyCode::Char('e') => app.expand_all(),
-                KeyCode::Char('c') => {
-                    app.tree_state.close_all();
-                }
+                KeyCode::Char('w') => app.save(),
+                KeyCode::Char('?') => app.help_open = true,
+                KeyCode::Char('p') if ctrl => app.open_palette(),
+                KeyCode::Up | KeyCode::Char('k') => app.select_up(),
+                KeyCode::Down | KeyCode::Char('j') => app.select_down(),
+                KeyCode::Left | KeyCode::Char('h') => app.go_up(),
+                KeyCode::Right | KeyCode::Char('l') => app.drill_in(),
+                KeyCode::Char('g') => app.pending_key = PendingKey::G,
+                KeyCode::Char('G') => app.select_bottom(),
+                KeyCode::Char(' ') => app.pending_key = PendingKey::Leader,
+                KeyCode::Char(']') => app.pending_key = PendingKey::BracketNext,
+                KeyCode::Char('[') => app.pending_key = PendingKey::BracketPrev,
+                KeyCode::Char('/') => app.open_name_jump(),
+                KeyCode::Char('n') => app.jump_next(),
+                KeyCode::Char('N') => app.jump_prev(),
                 KeyCode::Enter => app.handle_enter(),
-                KeyCode::Char('m') => app.open_picker(),
-                KeyCode::Char('b') => app.open_bulk_edit(),
-                KeyCode::Char('g') => app.toggle_swap(),
-                KeyCode::Char('s') => app.save(),
-                KeyCode::Char('p') => app.open_print_settings(),
                 _ => {}
             }
         }
@@ -1162,6 +1752,22 @@ mod tests {
             part_flag(&mismatched, &materials),
             Some("material thickness doesn't match this part's geometry")
         );
+    }
+
+    #[test]
+    fn all_parts_resolved_is_true_only_when_every_part_has_no_flag() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let all_resolved = vec![
+            part(0.75, Some("Baltic Birch 3/4"), false),
+            part(0.75, Some("Baltic Birch 3/4"), false),
+        ];
+        assert!(all_parts_resolved(&all_resolved, &materials));
+
+        let one_unresolved = vec![
+            part(0.75, Some("Baltic Birch 3/4"), false),
+            part(0.75, None, false),
+        ];
+        assert!(!all_parts_resolved(&one_unresolved, &materials));
     }
 
     #[test]
@@ -1391,5 +1997,103 @@ mod tests {
         let changed = apply_bulk_material(&mut parts, &BTreeMap::new(), &materials);
         assert_eq!(changed, vec![0]);
         assert_eq!(parts[0].material, None);
+    }
+
+    #[test]
+    fn next_flagged_finds_the_nearest_flagged_part_after_the_starting_index() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let parts = vec![
+            part(0.75, Some("Baltic Birch 3/4"), false),
+            part(0.75, None, false),
+            part(0.75, None, false),
+        ];
+        let order = [0, 1, 2];
+        assert_eq!(next_flagged(&parts, &materials, &order, 0), Some(1));
+        assert_eq!(next_flagged(&parts, &materials, &order, 1), Some(2));
+    }
+
+    #[test]
+    fn next_flagged_wraps_around_to_the_start() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let parts = vec![
+            part(0.75, None, false),
+            part(0.75, Some("Baltic Birch 3/4"), false),
+        ];
+        let order = [0, 1];
+        assert_eq!(next_flagged(&parts, &materials, &order, 1), Some(0));
+    }
+
+    #[test]
+    fn next_flagged_is_none_when_every_part_is_resolved() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let parts = vec![part(0.75, Some("Baltic Birch 3/4"), false)];
+        let order = [0];
+        assert_eq!(next_flagged(&parts, &materials, &order, 0), None);
+    }
+
+    #[test]
+    fn next_flagged_follows_tree_order_not_the_parts_vec_order() {
+        // Mirrors the real bug: `stepcrawl::group_parts` interleaves
+        // same-shaped parts from different assemblies in `Part`'s own
+        // Vec order, but jump-to-flagged must still walk in the order a
+        // user would browse the tree -- here, index 2 ("Middle / Backer")
+        // sits right after index 0 in the Vec, but tree order visits
+        // index 1 ("Left / Panel") first.
+        let materials: Vec<Material> = Vec::new();
+        let parts = vec![
+            part(0.75, None, false), // 0: "Left / Backer" (all unassigned -> flagged)
+            part(0.75, None, false), // 1: "Left / Panel"
+            part(0.75, None, false), // 2: "Middle / Backer"
+        ];
+        let order = [0, 1, 2]; // as `tree::depth_first_part_order` would give for Left, Left, Middle
+        assert_eq!(
+            next_flagged(&parts, &materials, &order, 0),
+            Some(1),
+            "next flagged after index 0 must be tree-order index 1, not skip ahead to index 2"
+        );
+    }
+
+    #[test]
+    fn prev_flagged_finds_the_nearest_flagged_part_before_the_starting_index() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let parts = vec![
+            part(0.75, None, false),
+            part(0.75, None, false),
+            part(0.75, Some("Baltic Birch 3/4"), false),
+        ];
+        let order = [0, 1, 2];
+        assert_eq!(prev_flagged(&parts, &materials, &order, 2), Some(1));
+        assert_eq!(prev_flagged(&parts, &materials, &order, 1), Some(0));
+    }
+
+    #[test]
+    fn prev_flagged_wraps_around_to_the_end() {
+        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let parts = vec![
+            part(0.75, Some("Baltic Birch 3/4"), false),
+            part(0.75, None, false),
+        ];
+        let order = [0, 1];
+        assert_eq!(prev_flagged(&parts, &materials, &order, 0), Some(1));
+    }
+
+    #[test]
+    fn fuzzy_rank_returns_every_candidate_in_order_for_an_empty_query() {
+        let candidates = ["Bench / Top", "Bench / Leg"];
+        assert_eq!(fuzzy_rank("", &candidates), vec![0, 1]);
+    }
+
+    #[test]
+    fn fuzzy_rank_ranks_a_closer_match_first() {
+        let candidates = ["Bench / Leg", "Bench / Top Panel"];
+        let ranked = fuzzy_rank("top", &candidates);
+        assert_eq!(ranked.first(), Some(&1));
+    }
+
+    #[test]
+    fn fuzzy_rank_excludes_non_matching_candidates() {
+        let candidates = ["Bench / Top", "Bench / Leg"];
+        let ranked = fuzzy_rank("zzz", &candidates);
+        assert!(ranked.is_empty());
     }
 }
