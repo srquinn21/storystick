@@ -51,11 +51,12 @@ const MM_PER_PT: f64 = 25.4 / 72.0;
 // parts (a small cleat, etc.) fall back.
 const LABEL_MIN_HEIGHT_MM: f64 = 9.0;
 
-/// Extra room reserved along a sheet diagram's left edge for the primary
-/// rip cuts' dimension ticks (see `render_rip_dimensions`) -- only
-/// reserved when a sheet actually has one; a single-strip sheet keeps
-/// the full page for its diagram, same as before this existed.
-const RIP_DIM_GUTTER_MM: f64 = 14.0;
+/// Extra room reserved along a sheet diagram's left edge (for rip
+/// ticks) and bottom edge (for crosscut ticks) -- see `render_dim_marks`
+/// -- only reserved on whichever side actually has a mark; a
+/// single-strip, single-part sheet keeps the full page for its diagram,
+/// same as before either gutter existed.
+const DIM_GUTTER_MM: f64 = 14.0;
 
 fn leaf(full_path: &str) -> &str {
     full_path.rsplit(" / ").next().unwrap_or(full_path)
@@ -647,55 +648,102 @@ fn on_sheet_label(code: &str, leaf: &str, height_mm: f64, dims_line: &str) -> St
     }
 }
 
-/// A sheet's primary rip cuts -- the ones that carve it into strips,
-/// spanning its full length_mm (see `core::nesting`'s module docs) -- as
-/// opposed to the narrower rips/crosscuts a strip's own internal packing
-/// can also produce. These are the "important key cutlines" worth
-/// marking directly on the diagram (see `render_rip_dimensions`); every
-/// cut, of either kind, still gets its own line in the Cut Instructions
-/// list (`render_cut_instructions_pages`).
-fn primary_rip_positions(sheet: &SheetLayout) -> Vec<f64> {
-    sheet
-        .cuts
-        .iter()
-        .filter(|c| {
-            c.kind == CutKind::Rip
-                && c.span_end_mm - c.span_start_mm >= sheet.stock.length_mm - 1e-3
+/// One dimension mark on the diagram: a tick at `position_mm` (the
+/// cut's sheet-wide coordinate, for placing the tick on the page) paired
+/// with the *size* to label it with -- the actual width or length of
+/// whatever this cut separates off, never the raw cumulative
+/// `Cut.position_mm` a mark sits at. See `dim_marks`'s own docs for why
+/// the two aren't the same number.
+struct DimMark {
+    position_mm: f64,
+    length_mm: f64,
+}
+
+/// The dimension marks worth drawing directly on a sheet's diagram for
+/// one `kind` of cut: `Rip`s (marked along the left gutter, one per
+/// strip) restricted to the primary, full-length ones that actually
+/// carve the sheet into strips -- the "important key cutlines" -- as
+/// opposed to the narrower rips a strip's own internal packing can also
+/// produce; `Crosscut`s (marked along the bottom gutter) taken
+/// unrestricted, since a crosscut has no sheet-wide "primary" cut the
+/// way a strip-defining rip does. Every cut of either kind still gets
+/// its own line in the Cut Instructions list regardless
+/// (`render_cut_instructions_pages`).
+///
+/// `length_mm` is `CutStep.offset_mm` -- already a segment size, not a
+/// cumulative position, see that field's own docs -- with `kerf_mm`
+/// subtracted back out: `offset_mm` is `(rough size) + kerf_mm`, the
+/// blade-width gap `pack()` reserved past this piece's own edge to keep
+/// it clear of its neighbor (see `Cut`'s docs), never material this
+/// piece actually keeps. Marking the raw, kerf-inflated number would
+/// have a woodworker rip or crosscut every single piece on the sheet a
+/// hair oversized.
+fn dim_marks(sheet: &SheetLayout, kerf_mm: f64, kind: CutKind, primary_only: bool) -> Vec<DimMark> {
+    cut_steps(sheet)
+        .into_iter()
+        .filter(|step| step.cut.kind == kind)
+        .filter(|step| {
+            if !primary_only {
+                return true;
+            }
+            let full_span = match kind {
+                CutKind::Rip => sheet.stock.length_mm,
+                CutKind::Crosscut => sheet.stock.width_mm,
+            };
+            step.cut.span_end_mm - step.cut.span_start_mm >= full_span - 1e-3
         })
-        .map(|c| c.position_mm)
+        .map(|step| DimMark {
+            position_mm: step.cut.position_mm,
+            length_mm: step.offset_mm - kerf_mm,
+        })
         .collect()
 }
 
-/// Dimension ticks in the gutter reserved by `render_sheet_page`, one per
-/// primary rip: a tick on the sheet's own edge, and a label giving that
-/// rip's distance from the reference corner (the same corner
-/// `mark_reference_corner` marks, and every Placement's own x_mm/y_mm is
-/// already measured from) -- a story-stick-style absolute measurement,
-/// not a segment length between consecutive rips.
-fn render_rip_dimensions(
+/// Dimension ticks along the left gutter (one per primary rip, anchored
+/// on the sheet's top edge at `origin_y`) or the bottom gutter (one per
+/// crosscut, anchored on its bottom edge at `bottom_y`) reserved by
+/// `render_sheet_page`: a tick on the sheet's own edge, projecting into
+/// the gutter, labeled with that cut's own width/length (see
+/// `DimMark`'s docs) -- never a position, so every label is a size you
+/// can check a board against directly, independent of any other mark.
+#[allow(clippy::too_many_arguments)] // plain PDF-drawing params, not worth a bespoke struct for one private helper
+fn render_dim_marks(
     page: &mut Page,
     origin_x: f64,
     origin_y: f64,
+    bottom_y: f64,
     scale: f64,
-    positions: &[f64],
+    axis: CutKind,
+    marks: &[DimMark],
     metrics: &Metrics,
 ) {
     const FONT_PT: f64 = 6.0;
-    let tick_x = origin_x - 3.0;
     page.set_stroke(90, 90, 90);
     page.set_line_width_mm(0.2);
-    for &position_mm in positions {
-        let y = origin_y + position_mm * scale;
-        page.line(tick_x, y, origin_x, y);
-        let label = format_mm_in(position_mm);
-        let label_w = metrics.width_mm(&label, FONT_PT, false);
-        page.text(
-            tick_x - 1.0 - label_w,
-            y + FONT_PT * 0.3,
-            &label,
-            false,
-            FONT_PT,
-        );
+    for mark in marks {
+        let label = format_mm_in(mark.length_mm);
+        match axis {
+            CutKind::Rip => {
+                let y = origin_y + mark.position_mm * scale;
+                let tick_x = origin_x - 3.0;
+                page.line(tick_x, y, origin_x, y);
+                let label_w = metrics.width_mm(&label, FONT_PT, false);
+                page.text(
+                    tick_x - 1.0 - label_w,
+                    y + FONT_PT * 0.3,
+                    &label,
+                    false,
+                    FONT_PT,
+                );
+            }
+            CutKind::Crosscut => {
+                let x = origin_x + mark.position_mm * scale;
+                let tick_y = bottom_y + 3.0;
+                page.line(x, bottom_y, x, tick_y);
+                let label_w = metrics.width_mm(&label, FONT_PT, false);
+                page.text(x - label_w / 2.0, tick_y + 4.5, &label, false, FONT_PT);
+            }
+        }
     }
     page.set_stroke(0, 0, 0);
     page.set_line_width_mm(0.2);
@@ -704,6 +752,7 @@ fn render_rip_dimensions(
 fn render_sheet_page(
     sheet: &SheetLayout,
     codes: &HashMap<String, String>,
+    kerf_mm: f64,
     trim_allowance_mm: f64,
     metrics: &Metrics,
 ) -> Page {
@@ -716,20 +765,27 @@ fn render_sheet_page(
     };
     let mut page = Page::new(page_w, page_h);
 
-    let rip_positions = primary_rip_positions(sheet);
-    let gutter = if rip_positions.is_empty() {
+    let rip_marks = dim_marks(sheet, kerf_mm, CutKind::Rip, true);
+    let crosscut_marks = dim_marks(sheet, kerf_mm, CutKind::Crosscut, false);
+    let left_gutter = if rip_marks.is_empty() {
         0.0
     } else {
-        RIP_DIM_GUTTER_MM
+        DIM_GUTTER_MM
+    };
+    let bottom_gutter = if crosscut_marks.is_empty() {
+        0.0
+    } else {
+        DIM_GUTTER_MM
     };
 
     let title_h = 12.0;
-    let usable_w = page_w - 2.0 * MARGIN_MM - gutter;
-    let usable_h = page_h - 2.0 * MARGIN_MM - title_h;
+    let usable_w = page_w - 2.0 * MARGIN_MM - left_gutter;
+    let usable_h = page_h - 2.0 * MARGIN_MM - title_h - bottom_gutter;
     let scale = (usable_w / stock.length_mm).min(usable_h / stock.width_mm);
 
-    let origin_x = MARGIN_MM + gutter;
+    let origin_x = MARGIN_MM + left_gutter;
     let origin_y = MARGIN_MM + title_h;
+    let bottom_y = origin_y + stock.width_mm * scale;
 
     let title = format!(
         "{} #{}  ({} x {} x {})",
@@ -813,12 +869,24 @@ fn render_sheet_page(
     }
 
     mark_reference_corner(&mut page, origin_x, origin_y, 5.0);
-    render_rip_dimensions(
+    render_dim_marks(
         &mut page,
         origin_x,
         origin_y,
+        bottom_y,
         scale,
-        &rip_positions,
+        CutKind::Rip,
+        &rip_marks,
+        metrics,
+    );
+    render_dim_marks(
+        &mut page,
+        origin_x,
+        origin_y,
+        bottom_y,
+        scale,
+        CutKind::Crosscut,
+        &crosscut_marks,
         metrics,
     );
     page
@@ -851,11 +919,16 @@ fn describe_outcome(outcome: &Outcome, codes: &HashMap<String, String>) -> Strin
 /// every piece a step mentions is named clearly enough (a Parts Index
 /// code, a numbered piece, or "an unused offcut") that following the
 /// list start to finish never requires re-reading the diagram.
-fn describe_cut_step(step: &CutStep, codes: &HashMap<String, String>) -> String {
+///
+/// `kerf_mm` is subtracted from `step.offset_mm` before it's shown, same
+/// as `DimMark.length_mm` on the diagram (see that type's own docs) --
+/// the raw offset includes the blade-width gap this cut also reserves
+/// past the piece's true edge, which isn't material the piece keeps.
+fn describe_cut_step(step: &CutStep, kerf_mm: f64, codes: &HashMap<String, String>) -> String {
     let source = describe_source(&step.source);
     let near = describe_outcome(&step.near, codes);
     let far = describe_outcome(&step.far, codes);
-    let offset = format_mm_in(step.offset_mm);
+    let offset = format_mm_in(step.offset_mm - kerf_mm);
     let axis = match step.cut.kind {
         CutKind::Rip => "width",
         CutKind::Crosscut => "length",
@@ -878,6 +951,7 @@ fn describe_cut_step(step: &CutStep, codes: &HashMap<String, String>) -> String 
 /// instruct.
 fn render_cut_instructions_pages(
     sheet: &SheetLayout,
+    kerf_mm: f64,
     codes: &HashMap<String, String>,
     metrics: &Metrics,
 ) -> Vec<Page> {
@@ -893,7 +967,7 @@ fn render_cut_instructions_pages(
     let rows: Vec<Vec<String>> = steps
         .iter()
         .enumerate()
-        .map(|(i, step)| vec![(i + 1).to_string(), describe_cut_step(step, codes)])
+        .map(|(i, step)| vec![(i + 1).to_string(), describe_cut_step(step, kerf_mm, codes)])
         .collect();
     let step_w = rows
         .iter()
@@ -941,20 +1015,29 @@ fn render_cut_instructions_pages(
 /// `group_sheets_by_section` -- see that function's docs for how a
 /// sheet's section is decided.
 ///
-/// `trim_allowance_mm`, when nonzero, draws a second, dashed rough-cut
-/// outline around each placement (final dims + trim_allowance_mm in each
-/// direction, extending from the placement's own origin -- see
-/// `mark_reference_corner`) alongside the solid final outline, and labels
-/// both. Must match whatever trim_allowance_mm was passed to `pack()` for
-/// this same Layout -- this only draws the rough outline, it doesn't
-/// derive it from anything in `Layout` itself.
+/// `kerf_mm`/`trim_allowance_mm` must match whatever was passed to
+/// `pack()` for this same `Layout` -- neither is derived from `Layout`
+/// itself, both only ever *drawn* from here: `kerf_mm` is subtracted
+/// back out of every dimension mark and Cut Instructions measurement
+/// (see `DimMark`'s docs for why); `trim_allowance_mm`, when nonzero,
+/// draws a second, dashed rough-cut outline around each placement
+/// (final dims + trim_allowance_mm in each direction, extending from the
+/// placement's own origin -- see `mark_reference_corner`) alongside the
+/// solid final outline, and labels both.
 pub fn render_pdf(
     layout: &Layout,
+    kerf_mm: f64,
     trim_allowance_mm: f64,
     classify: impl Fn(&str) -> Option<String>,
     unsectioned_label: &str,
 ) -> Vec<u8> {
-    let pages = build_pages(layout, trim_allowance_mm, classify, unsectioned_label);
+    let pages = build_pages(
+        layout,
+        kerf_mm,
+        trim_allowance_mm,
+        classify,
+        unsectioned_label,
+    );
     let mut doc = PdfDocument::new("Story Stick Cutlist");
     doc.with_pages(pages)
         .save(&PdfSaveOptions::default(), &mut Vec::new())
@@ -965,6 +1048,7 @@ pub fn render_pdf(
 /// parsing rendered PDF bytes back apart.
 fn build_pages(
     layout: &Layout,
+    kerf_mm: f64,
     trim_allowance_mm: f64,
     classify: impl Fn(&str) -> Option<String>,
     unsectioned_label: &str,
@@ -990,9 +1074,11 @@ fn build_pages(
 
         let (codes, dims) = assign_codes(sheets.iter().copied());
         for sheet in &sheets {
-            pages.push(render_sheet_page(sheet, &codes, trim_allowance_mm, &metrics).finish());
+            pages.push(
+                render_sheet_page(sheet, &codes, kerf_mm, trim_allowance_mm, &metrics).finish(),
+            );
             pages.extend(
-                render_cut_instructions_pages(sheet, &codes, &metrics)
+                render_cut_instructions_pages(sheet, kerf_mm, &codes, &metrics)
                     .into_iter()
                     .map(Page::finish),
             );
@@ -1011,7 +1097,7 @@ fn build_pages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nesting::{Cut, Material, Placement, StockSheet};
+    use crate::nesting::{pack, Cut, Material, PackablePart, Placement, StockSheet};
 
     fn test_stock() -> StockSheet {
         StockSheet {
@@ -1196,7 +1282,7 @@ mod tests {
             )])],
             unplaced: vec![],
         };
-        let bytes = render_pdf(&layout, 0.0, |_| None, "Unsectioned");
+        let bytes = render_pdf(&layout, 0.0, 0.0, |_| None, "Unsectioned");
         assert!(bytes.starts_with(b"%PDF"));
         assert!(bytes.len() > 500);
     }
@@ -1225,7 +1311,7 @@ mod tests {
         let rules = [("Carcass", "Carcasses"), ("Door", "Doors")];
         let classify = |path: &str| crate::tags::classify_by_keyword(path, &rules);
 
-        let pages = build_pages(&layout, 0.0, classify, "Unsectioned");
+        let pages = build_pages(&layout, 0.0, 0.0, classify, "Unsectioned");
 
         // 1 global BOM page, then per section (Carcasses, Doors): 1 front
         // page (title + BOM + notes) + 1 sheet page + 1 Parts Index page.
@@ -1297,7 +1383,7 @@ mod tests {
             near: Outcome::Piece(3),
             far: Outcome::Offcut,
         };
-        let description = describe_cut_step(&step, &HashMap::new());
+        let description = describe_cut_step(&step, 0.0, &HashMap::new());
         assert!(description.starts_with("On piece 2:"));
         assert!(description.contains(&format!(
             "Rip {} from its reference-corner edge",
@@ -1305,6 +1391,28 @@ mod tests {
         )));
         assert!(description.contains("cuts off piece 3"));
         assert!(description.contains("leaving an unused offcut"));
+    }
+
+    #[test]
+    fn describe_cut_step_subtracts_kerf_from_the_reported_measurement() {
+        // offset_mm already includes the blade-width gap this cut
+        // reserves past the piece's true edge (see `DimMark`'s docs) --
+        // the number shown must have that kerf subtracted back out.
+        let step = CutStep {
+            cut: Cut {
+                kind: CutKind::Rip,
+                position_mm: 600.0,
+                span_start_mm: 0.0,
+                span_end_mm: 900.0,
+            },
+            offset_mm: 150.0,
+            source: Source::Sheet,
+            near: Outcome::Piece(1),
+            far: Outcome::Offcut,
+        };
+        let description = describe_cut_step(&step, 3.2, &HashMap::new());
+        assert!(description.contains(&format_mm_in(150.0 - 3.2)));
+        assert!(!description.contains(&format_mm_in(150.0)));
     }
 
     #[test]
@@ -1323,7 +1431,7 @@ mod tests {
         };
         let mut codes = HashMap::new();
         codes.insert("Bench / Body A".to_string(), "P001".to_string());
-        let description = describe_cut_step(&step, &codes);
+        let description = describe_cut_step(&step, 0.0, &codes);
         assert!(description.starts_with("On the full sheet:"));
         assert!(description.contains("cuts off P001"));
     }
@@ -1332,7 +1440,7 @@ mod tests {
     fn render_cut_instructions_pages_is_empty_for_a_sheet_with_no_cuts() {
         let sheet = sheet_layout(vec![placement("Bench / Body A", 0.0, 0.0, 762.0, 438.0)]);
         let metrics = Metrics::new();
-        assert!(render_cut_instructions_pages(&sheet, &HashMap::new(), &metrics).is_empty());
+        assert!(render_cut_instructions_pages(&sheet, 0.0, &HashMap::new(), &metrics).is_empty());
     }
 
     #[test]
@@ -1346,8 +1454,50 @@ mod tests {
         }];
         let metrics = Metrics::new();
         assert_eq!(
-            render_cut_instructions_pages(&sheet, &HashMap::new(), &metrics).len(),
+            render_cut_instructions_pages(&sheet, 0.0, &HashMap::new(), &metrics).len(),
             1
+        );
+    }
+
+    fn two_strip_sheet_with_kerf() -> SheetLayout {
+        let test_stock = StockSheet {
+            material: Material {
+                name: "test".to_string(),
+                thickness_mm: 19.0,
+            },
+            length_mm: 1000.0,
+            width_mm: 500.0,
+        };
+        let parts = vec![
+            PackablePart::new("a", 700.0, 200.0, 19.0),
+            PackablePart::new("b", 400.0, 150.0, 19.0),
+        ];
+        let layout = pack(&parts, &[test_stock], 3.2, 0.0);
+        assert!(layout.unplaced.is_empty());
+        layout.sheets[0].clone()
+    }
+
+    #[test]
+    fn dim_marks_reports_each_rips_own_width_with_kerf_subtracted_out() {
+        let sheet = two_strip_sheet_with_kerf();
+        let marks = dim_marks(&sheet, 3.2, CutKind::Rip, true);
+        let lengths: Vec<f64> = marks.iter().map(|m| m.length_mm).collect();
+        assert_eq!(
+            lengths,
+            vec![200.0, 150.0],
+            "a's strip is 200mm wide and b's is 150mm, neither inflated by the kerf gap past it"
+        );
+    }
+
+    #[test]
+    fn dim_marks_reports_each_crosscuts_own_length_and_isnt_limited_to_primary_spans() {
+        let sheet = two_strip_sheet_with_kerf();
+        let marks = dim_marks(&sheet, 3.2, CutKind::Crosscut, false);
+        let lengths: Vec<f64> = marks.iter().map(|m| m.length_mm).collect();
+        assert_eq!(
+            lengths,
+            vec![700.0, 400.0],
+            "a is 700mm long and b is 400mm, matching their true lengths, not the sheet's cumulative position"
         );
     }
 
@@ -1378,7 +1528,7 @@ mod tests {
             unplaced: vec![],
         };
 
-        let pages = build_pages(&layout, 0.0, |_| None, "Unsectioned");
+        let pages = build_pages(&layout, 0.0, 0.0, |_| None, "Unsectioned");
 
         // global BOM + front page + (sheet + instructions) + sheet (no
         // instructions) + index.

@@ -1223,17 +1223,14 @@ impl App {
             return;
         }
         let parts: Vec<PackablePart> = self.parts.iter().map(Part::to_packable).collect();
+        let kerf_mm = self.project.settings.kerf_in * MM_PER_IN;
         let trim_allowance_mm = self.project.settings.trim_allowance_in * MM_PER_IN;
-        let layout = pack(
-            &parts,
-            &self.stock,
-            self.project.settings.kerf_in * MM_PER_IN,
-            trim_allowance_mm,
-        );
+        let layout = pack(&parts, &self.stock, kerf_mm, trim_allowance_mm);
         let unplaced = layout.unplaced.len();
         let out_path = self.project.out_pdf_path(&self.project_path);
         let pdf_bytes = storystick_core::diagrams::render_pdf(
             &layout,
+            kerf_mm,
             trim_allowance_mm,
             crate::sections::classify,
             crate::sections::UNSECTIONED,

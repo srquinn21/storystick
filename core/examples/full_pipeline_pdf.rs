@@ -71,7 +71,7 @@ fn main() {
     let kerf_mm = 0.125 * MM_PER_IN;
     let layout = pack(&parts, &stock, kerf_mm, 0.0);
 
-    let pdf_bytes = render_pdf(&layout, 0.0, |_path: &str| None, "Unsectioned");
+    let pdf_bytes = render_pdf(&layout, kerf_mm, 0.0, |_path: &str| None, "Unsectioned");
     std::fs::write(&out_path, &pdf_bytes).expect("failed to write PDF");
     println!(
         "wrote {} ({} bytes), {} sheets, {} unplaced",
