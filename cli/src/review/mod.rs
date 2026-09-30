@@ -290,7 +290,7 @@ impl Part {
             cross_in * MM_PER_IN,
             self.thickness_in * MM_PER_IN,
         );
-        part.material_name = self.material.as_ref().map(|m| m.name.clone());
+        part.material_name = self.material.as_ref().map(|m| m.name());
         part
     }
 }
@@ -314,7 +314,7 @@ fn compatible_materials(materials: &[Material], thickness_in: f64) -> Vec<&Mater
 fn find_material<'a>(materials: &'a [Material], name: &str) -> &'a Material {
     materials
         .iter()
-        .find(|m| m.name == name)
+        .find(|m| m.name() == name)
         .unwrap_or_else(|| {
             panic!("material {name:?} not found -- was Project::validate_references skipped?")
         })
@@ -1011,13 +1011,13 @@ impl App {
         let part = &self.parts[i];
         let mut options: Vec<String> = compatible_materials(&self.materials, part.thickness_in)
             .into_iter()
-            .map(|m| m.name.clone())
+            .map(|m| m.name())
             .collect();
         options.sort();
         options.insert(0, "(clear -- match by thickness alone)".to_string());
         let current_index = match &part.material {
             None => 0,
-            Some(m) => options.iter().position(|o| o == &m.name).unwrap_or(0),
+            Some(m) => options.iter().position(|o| o == &m.name()).unwrap_or(0),
         };
         let mut list_state = ListState::default();
         list_state.select(Some(current_index));
@@ -1063,7 +1063,7 @@ impl App {
             return;
         };
         let tag = tags[i].0.clone();
-        let mut options: Vec<String> = self.materials.iter().map(|m| m.name.clone()).collect();
+        let mut options: Vec<String> = self.materials.iter().map(|m| m.name()).collect();
         options.sort();
         options.insert(0, "(clear -- remove this tag's rule)".to_string());
         let current_index = match self.project.autofill.get(&tag) {
@@ -1237,7 +1237,7 @@ impl App {
                 // exception -- only `is_exception` (an explicit per-part
                 // override) persists. See `Part::is_exception`.
                 let material = if p.is_exception {
-                    p.material.as_ref().map(|m| m.name.clone())
+                    p.material.as_ref().map(|m| m.name())
                 } else {
                     None
                 };
@@ -1817,14 +1817,11 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn material(name: &str, thickness_in: f64) -> Material {
-        Material {
-            name: name.to_string(),
-            thickness_mm: thickness_in * MM_PER_IN,
-        }
+    fn material(species: &str, thickness_in: f64) -> Material {
+        Material::new(species, thickness_in * MM_PER_IN)
     }
 
-    fn part(thickness_in: f64, material: Option<&str>, unreliable: bool) -> Part {
+    fn part(thickness_in: f64, species: Option<&str>, unreliable: bool) -> Part {
         Part {
             path: "Bench / Body".to_string(),
             assignment_key: assignment_key("Bench / Body", 30.0, 20.0, thickness_in),
@@ -1836,11 +1833,8 @@ mod tests {
             thickness_in,
             unreliable,
             thickness_mismatch: false,
-            material: material.map(|name| Material {
-                name: name.to_string(),
-                thickness_mm: thickness_in * MM_PER_IN,
-            }),
-            is_exception: material.is_some(),
+            material: species.map(|species| Material::new(species, thickness_in * MM_PER_IN)),
+            is_exception: species.is_some(),
             grain_along_length: true,
             dimensions: DimensionAssignment::AS_GUESSED,
         }
@@ -1848,17 +1842,14 @@ mod tests {
 
     #[test]
     fn unreliable_parts_are_always_flagged_regardless_of_material() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75)];
-        let flagged = part(0.75, Some("Baltic Birch 3/4"), true);
+        let materials = vec![material("Baltic Birch", 0.75)];
+        let flagged = part(0.75, Some("Baltic Birch"), true);
         assert_eq!(part_flag(&flagged, &materials), Some("unreliable geometry"));
     }
 
     #[test]
     fn unassigned_part_is_flagged_when_multiple_materials_share_its_thickness() {
-        let materials = vec![
-            material("Baltic Birch 3/4", 0.75),
-            material("Sande Ply 3/4", 0.75),
-        ];
+        let materials = vec![material("Baltic Birch", 0.75), material("Sande Ply", 0.75)];
         let unassigned = part(0.75, None, false);
         assert_eq!(
             part_flag(&unassigned, &materials),
@@ -1873,8 +1864,8 @@ mod tests {
         // thickness joins the catalog. An unreviewed part must never look
         // the same as a resolved one.
         let materials = vec![
-            material("Baltic Birch 3/4", 0.75),
-            material("Baltic Birch 1/4", 0.25),
+            material("Baltic Birch", 0.75),
+            material("Baltic Birch", 0.25),
         ];
         let unassigned = part(0.75, None, false);
         assert_eq!(
@@ -1885,18 +1876,15 @@ mod tests {
 
     #[test]
     fn pinning_a_material_clears_the_ambiguous_flag() {
-        let materials = vec![
-            material("Baltic Birch 3/4", 0.75),
-            material("Sande Ply 3/4", 0.75),
-        ];
-        let pinned = part(0.75, Some("Sande Ply 3/4"), false);
+        let materials = vec![material("Baltic Birch", 0.75), material("Sande Ply", 0.75)];
+        let pinned = part(0.75, Some("Sande Ply"), false);
         assert_eq!(part_flag(&pinned, &materials), None);
     }
 
     #[test]
     fn thickness_mismatch_is_flagged_even_though_a_material_is_assigned() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75)];
-        let mut mismatched = part(0.75, Some("Baltic Birch 3/4"), false);
+        let materials = vec![material("Baltic Birch", 0.75)];
+        let mut mismatched = part(0.75, Some("Baltic Birch"), false);
         mismatched.thickness_mismatch = true;
         assert_eq!(
             part_flag(&mismatched, &materials),
@@ -1906,15 +1894,15 @@ mod tests {
 
     #[test]
     fn all_parts_resolved_is_true_only_when_every_part_has_no_flag() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let materials = vec![material("Baltic Birch", 0.75)];
         let all_resolved = vec![
-            part(0.75, Some("Baltic Birch 3/4"), false),
-            part(0.75, Some("Baltic Birch 3/4"), false),
+            part(0.75, Some("Baltic Birch"), false),
+            part(0.75, Some("Baltic Birch"), false),
         ];
         assert!(all_parts_resolved(&all_resolved, &materials));
 
         let one_unresolved = vec![
-            part(0.75, Some("Baltic Birch 3/4"), false),
+            part(0.75, Some("Baltic Birch"), false),
             part(0.75, None, false),
         ];
         assert!(!all_parts_resolved(&one_unresolved, &materials));
@@ -1934,10 +1922,7 @@ mod tests {
         // the raw largest/middle/smallest guess mislabels the 0.25" width
         // as thickness. Knowing the assigned material is really 3/4"
         // fixes it.
-        let bb34 = Material {
-            name: "Baltic Birch 3/4".to_string(),
-            thickness_mm: 0.75 * MM_PER_IN,
-        };
+        let bb34 = Material::new("Baltic Birch", 0.75 * MM_PER_IN);
         let (length_in, width_in, thickness_in, mismatch) = resolve_dims(
             (24.0, 0.75, 0.25),
             Some(&bb34),
@@ -1949,10 +1934,7 @@ mod tests {
 
     #[test]
     fn resolve_dims_flags_a_mismatch_instead_of_guessing() {
-        let unrelated = Material {
-            name: "1/8\" hardboard".to_string(),
-            thickness_mm: 0.125 * MM_PER_IN,
-        };
+        let unrelated = Material::new("Hardboard", 0.125 * MM_PER_IN);
         let (length_in, width_in, thickness_in, mismatch) = resolve_dims(
             (30.0, 20.0, 0.75),
             Some(&unrelated),
@@ -1974,10 +1956,7 @@ mod tests {
         // the resulting thickness_mismatch must reflect *this* thickness
         // against the material, not the one auto-correction would have
         // picked.
-        let bb34 = Material {
-            name: "Baltic Birch 3/4".to_string(),
-            thickness_mm: 0.75 * MM_PER_IN,
-        };
+        let bb34 = Material::new("Baltic Birch", 0.75 * MM_PER_IN);
         let swap_length_width = DimensionAssignment::AS_GUESSED.swap_length_width();
         let (length_in, width_in, thickness_in, mismatch) =
             resolve_dims((24.0, 0.75, 0.25), Some(&bb34), swap_length_width);
@@ -1995,7 +1974,7 @@ mod tests {
         // grain running along its 12" edge instead: to_packable must hand
         // the packer 12 as length_mm (the grain-aligned edge), not 24 --
         // length_in/width_in themselves stay exactly as measured/labeled.
-        let mut p = part(0.75, Some("Baltic Birch 3/4"), false);
+        let mut p = part(0.75, Some("Baltic Birch"), false);
         p.length_in = 24.0;
         p.width_in = 12.0;
         p.grain_along_length = false;
@@ -2043,12 +2022,12 @@ mod tests {
     #[test]
     fn compatible_materials_excludes_a_materially_different_thickness() {
         let materials = vec![
-            material("Baltic Birch 3/4", 0.75),
-            material("Baltic Birch 1/4", 0.25),
+            material("Baltic Birch", 0.75),
+            material("Baltic Birch", 0.25),
         ];
         let compat = compatible_materials(&materials, 0.75);
         assert_eq!(compat.len(), 1);
-        assert_eq!(compat[0].name, "Baltic Birch 3/4");
+        assert_eq!(compat[0].name(), "Baltic Birch 3/4\"");
     }
 
     #[test]
@@ -2083,19 +2062,19 @@ mod tests {
 
     #[test]
     fn save_persists_an_exception_but_never_a_rule_derived_material() {
-        let mut exception = part(0.75, Some("Baltic Birch 3/4"), false);
+        let mut exception = part(0.75, Some("Baltic Birch"), false);
         exception.is_exception = true;
         let saved = if exception.is_exception {
-            exception.material.as_ref().map(|m| m.name.clone())
+            exception.material.as_ref().map(|m| m.name())
         } else {
             None
         };
-        assert_eq!(saved, Some("Baltic Birch 3/4".to_string()));
+        assert_eq!(saved, Some("Baltic Birch 3/4\"".to_string()));
 
-        let mut rule_derived = part(0.75, Some("Baltic Birch 3/4"), false);
+        let mut rule_derived = part(0.75, Some("Baltic Birch"), false);
         rule_derived.is_exception = false;
         let saved = if rule_derived.is_exception {
-            rule_derived.material.as_ref().map(|m| m.name.clone())
+            rule_derived.material.as_ref().map(|m| m.name())
         } else {
             None
         };
@@ -2143,18 +2122,19 @@ mod tests {
 
     #[test]
     fn apply_bulk_material_re_resolves_every_non_exception_part_from_the_current_rule() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let bb34 = material("Baltic Birch", 0.75);
+        let materials = vec![bb34.clone()];
         let mut parts = vec![tagged_part("Bench / [Panel] A", None)];
         parts[0].is_exception = false;
         let mut autofill_map = BTreeMap::new();
-        autofill_map.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
+        autofill_map.insert("[Panel]".to_string(), bb34.name());
 
         let changed = apply_bulk_material(&mut parts, &autofill_map, &materials);
 
         assert_eq!(changed, vec![0]);
         assert_eq!(
-            parts[0].material.as_ref().map(|m| m.name.as_str()),
-            Some("Baltic Birch 3/4")
+            parts[0].material.as_ref().map(|m| m.name()),
+            Some(bb34.name())
         );
         assert!(
             !parts[0].is_exception,
@@ -2164,29 +2144,28 @@ mod tests {
 
     #[test]
     fn apply_bulk_material_never_touches_a_part_with_its_own_exception() {
-        let materials = vec![
-            material("Baltic Birch 3/4", 0.75),
-            material("Sande Ply 3/4", 0.75),
-        ];
-        let mut parts = vec![tagged_part("Bench / [Panel] A", Some("Sande Ply 3/4"))];
+        let bb34 = material("Baltic Birch", 0.75);
+        let sande34 = material("Sande Ply", 0.75);
+        let materials = vec![bb34.clone(), sande34.clone()];
+        let mut parts = vec![tagged_part("Bench / [Panel] A", Some("Sande Ply"))];
         parts[0].is_exception = true;
         let mut autofill_map = BTreeMap::new();
-        autofill_map.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
+        autofill_map.insert("[Panel]".to_string(), bb34.name());
 
         let changed = apply_bulk_material(&mut parts, &autofill_map, &materials);
 
         assert!(changed.is_empty());
         assert_eq!(
-            parts[0].material.as_ref().map(|m| m.name.as_str()),
-            Some("Sande Ply 3/4"),
+            parts[0].material.as_ref().map(|m| m.name()),
+            Some(sande34.name()),
             "an exception always outranks the rule, even after the rule changes"
         );
     }
 
     #[test]
     fn apply_bulk_material_removing_a_rule_unassigns_its_non_exception_parts() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75)];
-        let mut parts = vec![tagged_part("Bench / [Panel] A", Some("Baltic Birch 3/4"))];
+        let materials = vec![material("Baltic Birch", 0.75)];
+        let mut parts = vec![tagged_part("Bench / [Panel] A", Some("Baltic Birch"))];
         parts[0].is_exception = false;
         // No rule in the map at all -- simulates the rule having just
         // been removed via bulk-edit's "(clear)".
@@ -2197,9 +2176,9 @@ mod tests {
 
     #[test]
     fn next_flagged_finds_the_nearest_flagged_part_after_the_starting_index() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let materials = vec![material("Baltic Birch", 0.75)];
         let parts = vec![
-            part(0.75, Some("Baltic Birch 3/4"), false),
+            part(0.75, Some("Baltic Birch"), false),
             part(0.75, None, false),
             part(0.75, None, false),
         ];
@@ -2210,10 +2189,10 @@ mod tests {
 
     #[test]
     fn next_flagged_wraps_around_to_the_start() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let materials = vec![material("Baltic Birch", 0.75)];
         let parts = vec![
             part(0.75, None, false),
-            part(0.75, Some("Baltic Birch 3/4"), false),
+            part(0.75, Some("Baltic Birch"), false),
         ];
         let order = [0, 1];
         assert_eq!(next_flagged(&parts, &materials, &order, 1), Some(0));
@@ -2221,8 +2200,8 @@ mod tests {
 
     #[test]
     fn next_flagged_is_none_when_every_part_is_resolved() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75)];
-        let parts = vec![part(0.75, Some("Baltic Birch 3/4"), false)];
+        let materials = vec![material("Baltic Birch", 0.75)];
+        let parts = vec![part(0.75, Some("Baltic Birch"), false)];
         let order = [0];
         assert_eq!(next_flagged(&parts, &materials, &order, 0), None);
     }
@@ -2251,11 +2230,11 @@ mod tests {
 
     #[test]
     fn prev_flagged_finds_the_nearest_flagged_part_before_the_starting_index() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let materials = vec![material("Baltic Birch", 0.75)];
         let parts = vec![
             part(0.75, None, false),
             part(0.75, None, false),
-            part(0.75, Some("Baltic Birch 3/4"), false),
+            part(0.75, Some("Baltic Birch"), false),
         ];
         let order = [0, 1, 2];
         assert_eq!(prev_flagged(&parts, &materials, &order, 2), Some(1));
@@ -2264,9 +2243,9 @@ mod tests {
 
     #[test]
     fn prev_flagged_wraps_around_to_the_end() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75)];
+        let materials = vec![material("Baltic Birch", 0.75)];
         let parts = vec![
-            part(0.75, Some("Baltic Birch 3/4"), false),
+            part(0.75, Some("Baltic Birch"), false),
             part(0.75, None, false),
         ];
         let order = [0, 1];

@@ -516,7 +516,7 @@ fn bom_rows(bom: &[BomLine]) -> Vec<Vec<String>> {
         .map(|line| {
             vec![
                 line.qty.to_string(),
-                line.stock.material.name.clone(),
+                line.stock.material.name(),
                 format_mm_in(line.stock.length_mm),
                 format_mm_in(line.stock.width_mm),
                 format_mm_in(line.stock.thickness_mm()),
@@ -789,7 +789,7 @@ fn render_sheet_page(
 
     let title = format!(
         "{} #{}  ({} x {} x {})",
-        stock.material.name,
+        stock.material.name(),
         sheet.sheet_index + 1,
         format_mm_in(stock.length_mm),
         format_mm_in(stock.width_mm),
@@ -961,7 +961,7 @@ fn render_cut_instructions_pages(
     }
     let title = format!(
         "Cut Sequence -- {} #{}",
-        sheet.stock.material.name,
+        sheet.stock.material.name(),
         sheet.sheet_index + 1
     );
     let rows: Vec<Vec<String>> = steps
@@ -1101,10 +1101,7 @@ mod tests {
 
     fn test_stock() -> StockSheet {
         StockSheet {
-            material: Material {
-                name: "Baltic Birch 3/4".to_string(),
-                thickness_mm: 19.05,
-            },
+            material: Material::new("Baltic Birch", 19.05),
             length_mm: 2438.4,
             width_mm: 1219.2,
         }
@@ -1461,10 +1458,7 @@ mod tests {
 
     fn two_strip_sheet_with_kerf() -> SheetLayout {
         let test_stock = StockSheet {
-            material: Material {
-                name: "test".to_string(),
-                thickness_mm: 19.0,
-            },
+            material: Material::new("test", 19.0),
             length_mm: 1000.0,
             width_mm: 500.0,
         };

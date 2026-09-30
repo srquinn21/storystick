@@ -53,16 +53,58 @@ use std::hash::{Hash, Hasher};
 
 pub const DEFAULT_KERF_MM: f64 = 3.2; // ~1/8"
 
-/// A named material, looked up by name -- e.g. "Baltic Birch 3/4
-/// (finished 2 sides)" vs "Sande Ply 3/4 (utility)". Two materials can
-/// share a thickness_mm while being genuinely different stock, bought and
-/// used for different reasons (a hidden stretcher doesn't need show-face
+/// A material's identity: species, nominal thickness, and an optional
+/// finish note (e.g. "finished 2 sides", "utility") -- e.g. species
+/// "Baltic Birch", thickness 3/4", finish "finished 2 sides" vs species
+/// "Sande Ply", thickness 3/4", finish "utility". Two materials can share
+/// a thickness_mm while being genuinely different stock, bought and used
+/// for different reasons (a hidden stretcher doesn't need show-face
 /// plywood). Thickness alone was never a strong enough key for "what
 /// should this part be cut from" -- that's what this type is for.
+///
+/// `name()` renders these three fields into the one display/lookup string
+/// used everywhere a material is referenced by name (a project's own
+/// `materials:` subset, `autofill`/`assignments` values, the BOM, PDF
+/// titles) -- always in the same order, so that string can no longer
+/// drift the way a hand-typed name could (species-first vs
+/// thickness-first, a missing or misplaced finish note).
 #[derive(Debug, Clone)]
 pub struct Material {
-    pub name: String,
+    pub species: String,
     pub thickness_mm: f64,
+    pub finish: Option<String>,
+}
+
+impl Material {
+    pub fn new(species: impl Into<String>, thickness_mm: f64) -> Self {
+        Self {
+            species: species.into(),
+            thickness_mm,
+            finish: None,
+        }
+    }
+
+    pub fn with_finish(mut self, finish: impl Into<String>) -> Self {
+        self.finish = Some(finish.into());
+        self
+    }
+
+    /// The canonical display/lookup string: "<species> <thickness>" or
+    /// "<species> <thickness> (<finish>)" -- always in this order, and
+    /// always computed, never hand-authored, so it can't drift.
+    pub fn name(&self) -> String {
+        let thickness = crate::units::format_mm_in(self.thickness_mm);
+        match &self.finish {
+            Some(finish) => format!("{} {} ({})", self.species, thickness, finish),
+            None => format!("{} {}", self.species, thickness),
+        }
+    }
+}
+
+impl std::fmt::Display for Material {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
 }
 
 // f64 isn't Eq/Hash (NaN), so these are implemented by hand comparing bit
@@ -72,14 +114,17 @@ pub struct Material {
 // that might differ by an ULP.
 impl PartialEq for Material {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.thickness_mm.to_bits() == other.thickness_mm.to_bits()
+        self.species == other.species
+            && self.thickness_mm.to_bits() == other.thickness_mm.to_bits()
+            && self.finish == other.finish
     }
 }
 impl Eq for Material {}
 impl Hash for Material {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
+        self.species.hash(state);
         self.thickness_mm.to_bits().hash(state);
+        self.finish.hash(state);
     }
 }
 
@@ -534,7 +579,10 @@ pub fn pack(
     for bucket in &order {
         let pieces = &pieces_by_bucket[bucket];
         let mut candidates: Vec<&StockSheet> = match bucket {
-            Bucket::Material(name) => stock.iter().filter(|s| &s.material.name == name).collect(),
+            Bucket::Material(name) => stock
+                .iter()
+                .filter(|s| s.material.name() == *name)
+                .collect(),
             Bucket::Thickness(bits) => stock
                 .iter()
                 .filter(|s| s.thickness_mm().to_bits() == *bits)
@@ -611,7 +659,7 @@ pub fn bill_of_materials<'a>(sheets: impl IntoIterator<Item = &'a SheetLayout>) 
         })
         .collect();
     lines.sort_by(|a, b| {
-        a.stock.material.name.cmp(&b.stock.material.name).then(
+        a.stock.material.name().cmp(&b.stock.material.name()).then(
             a.stock
                 .thickness_mm()
                 .partial_cmp(&b.stock.thickness_mm())
@@ -839,16 +887,10 @@ mod tests {
     use super::*;
 
     fn three_quarter() -> Material {
-        Material {
-            name: "3/4 Baltic Birch".to_string(),
-            thickness_mm: 19.05,
-        }
+        Material::new("Baltic Birch", 19.05)
     }
     fn quarter() -> Material {
-        Material {
-            name: "1/4 Baltic Birch".to_string(),
-            thickness_mm: 6.35,
-        }
+        Material::new("Baltic Birch", 6.35)
     }
     fn stock() -> Vec<StockSheet> {
         vec![
@@ -945,15 +987,15 @@ mod tests {
         let layout = pack(&parts, &stock(), DEFAULT_KERF_MM, 0.0);
         let bom = bill_of_materials(&layout.sheets);
 
-        let by_name: HashMap<&str, usize> = bom
+        let by_name: HashMap<String, usize> = bom
             .iter()
-            .map(|l| (l.stock.material.name.as_str(), l.qty))
+            .map(|l| (l.stock.material.name(), l.qty))
             .collect();
         assert_eq!(
-            by_name["3/4 Baltic Birch"], 1,
+            by_name["Baltic Birch 3/4\""], 1,
             "both 30x16in pieces fit one 96x48in sheet with real packing"
         );
-        assert_eq!(by_name["1/4 Baltic Birch"], 1);
+        assert_eq!(by_name["Baltic Birch 1/4\""], 1);
         assert_eq!(
             bom.iter().map(|l| l.qty).sum::<usize>(),
             layout.sheets.len()
@@ -989,14 +1031,8 @@ mod tests {
 
     #[test]
     fn material_name_pins_a_part_even_at_shared_thickness() {
-        let finished = Material {
-            name: "Baltic Birch 3/4 (finished)".to_string(),
-            thickness_mm: 19.05,
-        };
-        let utility = Material {
-            name: "Sande Ply 3/4 (utility)".to_string(),
-            thickness_mm: 19.05,
-        };
+        let finished = Material::new("Baltic Birch", 19.05).with_finish("finished");
+        let utility = Material::new("Sande Ply", 19.05).with_finish("utility");
         let stock = vec![
             StockSheet {
                 material: finished.clone(),
@@ -1010,27 +1046,25 @@ mod tests {
             },
         ];
         let panel = PackablePart {
-            material_name: Some(finished.name.clone()),
+            material_name: Some(finished.name()),
             ..PackablePart::new("show-face panel", 700.0, 400.0, 19.05)
         };
         let stretcher = PackablePart {
-            material_name: Some(utility.name.clone()),
+            material_name: Some(utility.name()),
             ..PackablePart::new("hidden stretcher", 700.0, 100.0, 19.05)
         };
 
         let layout = pack(&[panel, stretcher], &stock, DEFAULT_KERF_MM, 0.0);
 
         assert!(layout.unplaced.is_empty());
-        let materials_used: HashSet<&str> = layout
+        let materials_used: HashSet<String> = layout
             .sheets
             .iter()
-            .map(|s| s.stock.material.name.as_str())
+            .map(|s| s.stock.material.name())
             .collect();
         assert_eq!(
             materials_used,
-            [finished.name.as_str(), utility.name.as_str()]
-                .into_iter()
-                .collect()
+            [finished.name(), utility.name()].into_iter().collect()
         );
         for sheet in &layout.sheets {
             let labels: HashSet<&str> = sheet
@@ -1038,7 +1072,7 @@ mod tests {
                 .iter()
                 .map(|p| p.part_label.as_str())
                 .collect();
-            if sheet.stock.material.name == finished.name {
+            if sheet.stock.material.name() == finished.name() {
                 assert_eq!(labels, ["show-face panel"].into_iter().collect());
             } else {
                 assert_eq!(labels, ["hidden stretcher"].into_iter().collect());
@@ -1052,7 +1086,7 @@ mod tests {
         let layout = pack(&[part], &stock(), DEFAULT_KERF_MM, 0.0);
 
         assert!(layout.unplaced.is_empty());
-        assert_eq!(layout.sheets[0].stock.material.name, "3/4 Baltic Birch");
+        assert_eq!(layout.sheets[0].stock.material.name(), "Baltic Birch 3/4\"");
     }
 
     #[test]
@@ -1075,10 +1109,7 @@ mod tests {
     #[test]
     fn short_part_reuses_leftover_height_within_a_strip() {
         let test_stock = StockSheet {
-            material: Material {
-                name: "test".to_string(),
-                thickness_mm: 19.0,
-            },
+            material: Material::new("test", 19.0),
             length_mm: 1000.0,
             width_mm: 500.0,
         };
@@ -1124,10 +1155,7 @@ mod tests {
         // that: every part placed, and no more sheets used than pieces
         // that can't share space at all actually require.
         let test_stock = StockSheet {
-            material: Material {
-                name: "test".to_string(),
-                thickness_mm: 19.0,
-            },
+            material: Material::new("test", 19.0),
             length_mm: 960.0,
             width_mm: 480.0,
         };
@@ -1168,10 +1196,7 @@ mod tests {
         // each strip's own opening then records the rip that frees it
         // from the sheet remaining above it at the time.
         let test_stock = StockSheet {
-            material: Material {
-                name: "test".to_string(),
-                thickness_mm: 19.0,
-            },
+            material: Material::new("test", 19.0),
             length_mm: 1000.0,
             width_mm: 500.0,
         };
@@ -1203,10 +1228,7 @@ mod tests {
     #[test]
     fn a_strip_reaching_the_sheets_top_edge_needs_no_closing_rip() {
         let test_stock = StockSheet {
-            material: Material {
-                name: "test".to_string(),
-                thickness_mm: 19.0,
-            },
+            material: Material::new("test", 19.0),
             length_mm: 1000.0,
             width_mm: 500.0,
         };
@@ -1223,10 +1245,7 @@ mod tests {
     #[test]
     fn a_part_exactly_filling_its_free_rect_needs_no_cut() {
         let test_stock = StockSheet {
-            material: Material {
-                name: "test".to_string(),
-                thickness_mm: 19.0,
-            },
+            material: Material::new("test", 19.0),
             length_mm: 400.0,
             width_mm: 200.0,
         };
@@ -1328,10 +1347,7 @@ mod tests {
     #[test]
     fn pack_produces_a_cut_sequence_that_isolates_every_placement() {
         let test_stock = StockSheet {
-            material: Material {
-                name: "test".to_string(),
-                thickness_mm: 19.0,
-            },
+            material: Material::new("test", 19.0),
             length_mm: 960.0,
             width_mm: 480.0,
         };
@@ -1362,10 +1378,7 @@ mod tests {
         // gone from it -- its own rip, and a's own crosscut, must be
         // described relative to the piece each one actually lands on.
         let test_stock = StockSheet {
-            material: Material {
-                name: "test".to_string(),
-                thickness_mm: 19.0,
-            },
+            material: Material::new("test", 19.0),
             length_mm: 1000.0,
             width_mm: 500.0,
         };
@@ -1424,10 +1437,7 @@ mod tests {
         // leaf's far edge too) would never fire once kerf_mm > 0; only
         // matching by the corner they share is correct.
         let test_stock = StockSheet {
-            material: Material {
-                name: "test".to_string(),
-                thickness_mm: 19.0,
-            },
+            material: Material::new("test", 19.0),
             length_mm: 1000.0,
             width_mm: 500.0,
         };
@@ -1458,10 +1468,7 @@ mod tests {
     #[test]
     fn cut_steps_every_numbered_piece_is_addressed_by_a_later_step() {
         let test_stock = StockSheet {
-            material: Material {
-                name: "test".to_string(),
-                thickness_mm: 19.0,
-            },
+            material: Material::new("test", 19.0),
             length_mm: 960.0,
             width_mm: 480.0,
         };

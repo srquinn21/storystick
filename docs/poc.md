@@ -242,6 +242,37 @@ top-level field (`#[serde(deny_unknown_fields)]`), so a stray pre-nesting
 zero stock. **Implemented** (`scripts/stock.example.yaml` and this
 user's own `~/.config/storystick/stock.yaml` both migrated).
 
+### Structured material naming
+
+`Material`'s display/lookup string used to be one free-typed `name`
+field, with species, thickness, and an optional finish note all folded
+into it by hand (e.g. `"Baltic Birch 3/4 (finished 2 sides)"`). Nothing
+enforced an order or format on that text, and the catalog drifted as a
+result -- one test fixture alone had `"Baltic Birch 3/4"` in one place
+and `"3/4 Baltic Birch"` in another for what was meant to be the same
+kind of name. A woodworker picking stock reasons about species,
+thickness, and finish as three separate questions; a name that happened
+to answer all three in whatever order it was typed gave no guarantee two
+authors (or the same author on two days) would answer them the same way.
+
+**Resolved:** `Material` now holds `species: String`, `thickness_mm:
+f64`, and `finish: Option<String>` as its real fields (`stock.yaml`'s
+`MaterialEntry` mirrors this: `species`/`thickness_in`/`finish`,
+replacing the old `name` field). The display/lookup string is
+`Material::name()`, always computed as `"<species> <thickness>"` or
+`"<species> <thickness> (<finish>)"` (thickness rendered via
+`units::format_mm_in`, e.g. `3/4"`), never hand-typed again. Every place
+that used to compare or sort by the free-typed `name` field now calls
+`.name()` instead; equality/hashing compare the three fields directly
+rather than the rendered string. This keeps the same "a material's
+display name doubles as its reference identity" design `Validated
+material references` above already settled on (a separate stable `id`
+was rejected there, and nothing about this change reopens that) --
+`Project`'s `materials:`/`autofill:`/`assignments:` still reference
+materials by this one string, it's just guaranteed self-consistent now.
+**Implemented** (`scripts/stock.example.yaml` and this user's own
+`~/.config/storystick/stock.yaml` both migrated).
+
 ### Bulk-edit mode (by tag)
 
 Proposed to handle scale once a project is one big export: a mode that

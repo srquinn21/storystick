@@ -435,8 +435,8 @@ fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
     let material = part
         .material
         .as_ref()
-        .map(|m| m.name.as_str())
-        .unwrap_or("-");
+        .map(|m| m.name())
+        .unwrap_or_else(|| "-".to_string());
     let grain = if part.grain_along_length {
         "along length"
     } else {
@@ -488,7 +488,7 @@ fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
     let width = popup_width(
         60,
         [
-            plain_field("Material:", material),
+            plain_field("Material:", &material),
             plain_field("Grain:", grain),
             plain_field("Dimensions:", &dimensions),
             plain_hint,
@@ -500,7 +500,7 @@ fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(width, 8, area);
 
     let lines = vec![
-        field_line("Material:", material, pe.focus == PartEditField::Material),
+        field_line("Material:", &material, pe.focus == PartEditField::Material),
         Line::from(""),
         field_line("Grain:", grain, pe.focus == PartEditField::Grain),
         Line::from(""),

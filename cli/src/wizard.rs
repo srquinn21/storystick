@@ -101,7 +101,7 @@ fn pick_step_file(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
 fn pick_materials(global_stock: &[StockSheet]) -> Result<Vec<String>, Box<dyn Error>> {
     let names: Vec<String> = stock::distinct_materials(global_stock)
         .into_iter()
-        .map(|m| m.name)
+        .map(|m| m.name())
         .collect();
     if names.is_empty() {
         return Err("the stock catalog has no materials -- add some to stock.yaml first".into());

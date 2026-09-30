@@ -304,8 +304,8 @@ pub(super) fn leaf_line(part: &Part, flagged: bool) -> Line<'static> {
     let material = part
         .material
         .as_ref()
-        .map(|m| m.name.as_str())
-        .unwrap_or("-");
+        .map(|m| m.name())
+        .unwrap_or_else(|| "-".to_string());
     let left = format!("{marker}{name:<NAME_FIELD_WIDTH$}");
     let measurements = format!(
         " {:>9.4}  {:>9.4}  {:>8.4} ",
@@ -358,11 +358,8 @@ pub(super) fn folder_line(name: &str, flagged: usize) -> Line<'static> {
 mod tests {
     use super::*;
 
-    fn material(name: &str, thickness_in: f64) -> Material {
-        Material {
-            name: name.to_string(),
-            thickness_mm: thickness_in * 25.4,
-        }
+    fn material(species: &str, thickness_in: f64) -> Material {
+        Material::new(species, thickness_in * 25.4)
     }
 
     /// A part with no material assigned (so `part_flag` always flags it by

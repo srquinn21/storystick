@@ -103,7 +103,7 @@ impl Project {
             .map(|name| {
                 global
                     .iter()
-                    .find(|m| &m.name == name)
+                    .find(|m| &m.name() == name)
                     .cloned()
                     .ok_or_else(|| {
                         format!("storystick.yaml: material {name:?} not found in the stock catalog")
@@ -118,7 +118,7 @@ impl Project {
     pub(crate) fn resolve_stock(&self, global: &[StockSheet]) -> Vec<StockSheet> {
         global
             .iter()
-            .filter(|s| self.materials.iter().any(|m| m == &s.material.name))
+            .filter(|s| self.materials.iter().any(|m| m == &s.material.name()))
             .cloned()
             .collect()
     }
@@ -138,7 +138,8 @@ impl Project {
     /// it can name the offending file key instead of just leaving a part
     /// mysteriously unresolved.
     pub(crate) fn validate_references(&self, materials: &[Material]) -> Result<(), Box<dyn Error>> {
-        let known: Vec<&str> = materials.iter().map(|m| m.name.as_str()).collect();
+        let known: Vec<String> = materials.iter().map(|m| m.name()).collect();
+        let known: Vec<&str> = known.iter().map(String::as_str).collect();
         for (tag, name) in &self.autofill {
             if !known.contains(&name.as_str()) {
                 return Err(unresolved_material_err(
@@ -251,11 +252,8 @@ mod tests {
     use crate::assignments::DimensionAssignment;
     use std::collections::HashSet;
 
-    fn material(name: &str, thickness_mm: f64) -> Material {
-        Material {
-            name: name.to_string(),
-            thickness_mm,
-        }
+    fn material(species: &str, thickness_mm: f64) -> Material {
+        Material::new(species, thickness_mm)
     }
 
     #[test]
@@ -345,26 +343,26 @@ assignments:
     #[test]
     fn resolve_materials_looks_up_by_name_against_the_global_catalog() {
         let global = vec![
-            material("Baltic Birch 3/4", 19.05),
-            material("Baltic Birch 1/4", 6.35),
+            material("Baltic Birch", 19.05),
+            material("Baltic Birch", 6.35),
         ];
         let project = Project {
             step: "model.step".to_string(),
-            materials: vec!["Baltic Birch 3/4".to_string()],
+            materials: vec![material("Baltic Birch", 19.05).name()],
             autofill: BTreeMap::new(),
             settings: Settings::default(),
             assignments: BTreeMap::new(),
         };
         let resolved = project.resolve_materials(&global).unwrap();
-        assert_eq!(resolved, vec![material("Baltic Birch 3/4", 19.05)]);
+        assert_eq!(resolved, vec![material("Baltic Birch", 19.05)]);
     }
 
     #[test]
     fn resolve_materials_errs_when_a_referenced_name_is_missing_from_the_catalog() {
-        let global = vec![material("Baltic Birch 3/4", 19.05)];
+        let global = vec![material("Baltic Birch", 19.05)];
         let project = Project {
             step: "model.step".to_string(),
-            materials: vec!["Sande Ply 3/4".to_string()],
+            materials: vec![material("Sande Ply", 19.05).name()],
             autofill: BTreeMap::new(),
             settings: Settings::default(),
             assignments: BTreeMap::new(),
@@ -375,11 +373,11 @@ assignments:
 
     #[test]
     fn resolve_stock_keeps_only_sheets_of_the_projects_own_materials() {
-        let bb34 = material("Baltic Birch 3/4", 19.05);
-        let sande34 = material("Sande Ply 3/4", 19.05);
+        let bb34 = material("Baltic Birch", 19.05);
+        let sande34 = material("Sande Ply", 19.05);
         let global = vec![
             StockSheet {
-                material: bb34,
+                material: bb34.clone(),
                 length_mm: 2438.4,
                 width_mm: 1219.2,
             },
@@ -391,36 +389,35 @@ assignments:
         ];
         let project = Project {
             step: "model.step".to_string(),
-            materials: vec!["Baltic Birch 3/4".to_string()],
+            materials: vec![bb34.name()],
             autofill: BTreeMap::new(),
             settings: Settings::default(),
             assignments: BTreeMap::new(),
         };
         let resolved = project.resolve_stock(&global);
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].material.name, "Baltic Birch 3/4");
+        assert_eq!(resolved[0].material.name(), bb34.name());
     }
 
     #[test]
     fn validate_references_passes_when_autofill_and_assignments_name_real_materials() {
-        let materials = vec![
-            material("Baltic Birch 3/4", 19.05),
-            material("Sande Ply 3/4", 19.05),
-        ];
+        let bb34 = material("Baltic Birch", 19.05);
+        let sande34 = material("Sande Ply", 19.05);
+        let materials = vec![bb34.clone(), sande34.clone()];
         let mut autofill = BTreeMap::new();
-        autofill.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
+        autofill.insert("[Panel]".to_string(), bb34.name());
         let mut assignments = BTreeMap::new();
         assignments.insert(
             "Bench / Body".to_string(),
             PartOverride {
-                material: Some("Sande Ply 3/4".to_string()),
+                material: Some(sande34.name()),
                 grain_along_length: true,
                 dimensions: DimensionAssignment::AS_GUESSED,
             },
         );
         let project = Project {
             step: "model.step".to_string(),
-            materials: vec!["Baltic Birch 3/4".to_string(), "Sande Ply 3/4".to_string()],
+            materials: vec![bb34.name(), sande34.name()],
             autofill,
             settings: Settings::default(),
             assignments,
@@ -430,12 +427,13 @@ assignments:
 
     #[test]
     fn validate_references_errs_and_suggests_the_close_name_for_a_typo_d_autofill_rule() {
-        let materials = vec![material("Baltic Birch 3/4", 19.05)];
+        let bb34 = material("Baltic Birch", 19.05);
+        let materials = vec![bb34.clone()];
         let mut autofill = BTreeMap::new();
         autofill.insert("[Panel]".to_string(), "Baltic Brich 3/4".to_string());
         let project = Project {
             step: "model.step".to_string(),
-            materials: vec!["Baltic Birch 3/4".to_string()],
+            materials: vec![bb34.name()],
             autofill,
             settings: Settings::default(),
             assignments: BTreeMap::new(),
@@ -452,8 +450,9 @@ assignments:
             err.contains("Baltic Brich 3/4"),
             "should name the bad value: {err}"
         );
+        let name = bb34.name();
         assert!(
-            err.contains("did you mean \"Baltic Birch 3/4\""),
+            err.contains(&format!("did you mean {name:?}")),
             "should suggest the close match: {err}"
         );
     }
@@ -461,7 +460,8 @@ assignments:
     #[test]
     fn validate_references_errs_on_an_unknown_assignment_material_with_no_suggestion_when_nothing_is_close(
     ) {
-        let materials = vec![material("Baltic Birch 3/4", 19.05)];
+        let bb34 = material("Baltic Birch", 19.05);
+        let materials = vec![bb34.clone()];
         let mut assignments = BTreeMap::new();
         assignments.insert(
             "Bench / Body".to_string(),
@@ -473,7 +473,7 @@ assignments:
         );
         let project = Project {
             step: "model.step".to_string(),
-            materials: vec!["Baltic Birch 3/4".to_string()],
+            materials: vec![bb34.name()],
             autofill: BTreeMap::new(),
             settings: Settings::default(),
             assignments,
@@ -489,7 +489,8 @@ assignments:
         assert!(err.contains("Oak"), "should name the bad value: {err}");
         assert!(
             !err.contains("did you mean"),
-            "\"Oak\" isn't a plausible typo of \"Baltic Birch 3/4\": {err}"
+            "\"Oak\" isn't a plausible typo of {:?}: {err}",
+            bb34.name()
         );
     }
 

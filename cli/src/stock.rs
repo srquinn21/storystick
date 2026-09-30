@@ -19,17 +19,28 @@ struct SheetSizeEntry {
     width_in: f64,
 }
 
-/// One buyable material: a name, its thickness, and every size it's sold
-/// in. Sheet sizes are nested here rather than cross-referenced by name
-/// from a separate top-level list, so a sheet can't name the wrong
-/// material (or a material that's been renamed or removed since) --
-/// there's no name to get wrong, and a material's thickness is typed in
-/// exactly one place no matter how many sizes it's sold in.
+/// One buyable material: species, thickness, an optional finish note, and
+/// every size it's sold in. Sheet sizes are nested here rather than
+/// cross-referenced by name from a separate top-level list, so a sheet
+/// can't name the wrong material (or a material that's been renamed or
+/// removed since) -- there's no name to get wrong, and a material's
+/// thickness is typed in exactly one place no matter how many sizes it's
+/// sold in.
+///
+/// `species`/`thickness_in`/`finish` split out what used to be one
+/// free-typed `name` field -- a woodworker cares about each of the three
+/// independently (picking stock means picking a species, a thickness, and
+/// whether a finish matters), but a hand-typed name gave no guarantee
+/// those three ever appeared in the same order or format twice. The
+/// display/lookup name (`Material::name`) is now always computed from
+/// these fields, never typed here.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MaterialEntry {
-    name: String,
+    species: String,
     thickness_in: f64,
+    #[serde(default)]
+    finish: Option<String>,
     #[serde(default)]
     sheets: Vec<SheetSizeEntry>,
 }
@@ -71,10 +82,10 @@ pub(crate) fn parse(text: &str) -> Result<Vec<StockSheet>, Box<dyn Error>> {
 
     let mut stock = Vec::new();
     for entry in doc.materials {
-        let material = Material {
-            name: entry.name,
-            thickness_mm: entry.thickness_in * MM_PER_IN,
-        };
+        let mut material = Material::new(entry.species, entry.thickness_in * MM_PER_IN);
+        if let Some(finish) = entry.finish {
+            material = material.with_finish(finish);
+        }
         for sheet in entry.sheets {
             stock.push(StockSheet {
                 material: material.clone(),
@@ -96,16 +107,16 @@ pub(crate) fn read(path: &Path) -> Result<Vec<StockSheet>, Box<dyn Error>> {
     parse(&text)
 }
 
-/// Every distinct material named across `stock`'s sheets, deduped by
-/// name, first-appearance order -- the whole shop catalog's materials,
-/// with sheet-size variety collapsed away. A project's own material
-/// subset (`crate::project::Project::resolve_materials`) filters this
-/// down further to just what that project actually uses.
+/// Every distinct material across `stock`'s sheets, deduped by identity
+/// (species + thickness + finish), first-appearance order -- the whole
+/// shop catalog's materials, with sheet-size variety collapsed away. A
+/// project's own material subset (`crate::project::Project::resolve_materials`)
+/// filters this down further to just what that project actually uses.
 pub(crate) fn distinct_materials(stock: &[StockSheet]) -> Vec<Material> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for sheet in stock {
-        if seen.insert(sheet.material.name.clone()) {
+        if seen.insert(sheet.material.clone()) {
             out.push(sheet.material.clone());
         }
     }
@@ -120,12 +131,13 @@ mod tests {
     fn parse_reads_materials_with_their_nested_sheets() {
         let yaml = r#"
 materials:
-  - name: "Baltic Birch 3/4 (finished 2 sides)"
+  - species: "Baltic Birch"
     thickness_in: 0.75
+    finish: "finished 2 sides"
     sheets:
       - length_in: 96
         width_in: 48
-  - name: "Baltic Birch 1/4"
+  - species: "Baltic Birch"
     thickness_in: 0.25
     sheets:
       - length_in: 96
@@ -135,8 +147,8 @@ materials:
 
         assert_eq!(stock.len(), 2);
         assert_eq!(
-            stock[0].material.name,
-            "Baltic Birch 3/4 (finished 2 sides)"
+            stock[0].material.name(),
+            "Baltic Birch 3/4\" (finished 2 sides)"
         );
         assert!((stock[0].material.thickness_mm - 0.75 * MM_PER_IN).abs() < 1e-9);
         assert!((stock[0].length_mm - 96.0 * MM_PER_IN).abs() < 1e-9);
@@ -149,7 +161,7 @@ materials:
         // thickness -- there's no per-sheet thickness field to drift.
         let yaml = r#"
 materials:
-  - name: "Baltic Birch 3/4"
+  - species: "Baltic Birch"
     thickness_in: 0.75
     sheets:
       - length_in: 96
@@ -169,7 +181,7 @@ materials:
     fn parse_a_material_with_no_sheets_yields_no_stock_for_it() {
         let yaml = r#"
 materials:
-  - name: "Baltic Birch 3/4"
+  - species: "Baltic Birch"
     thickness_in: 0.75
 "#;
         assert!(parse(yaml).unwrap().is_empty());
@@ -183,7 +195,7 @@ materials:
         // would do, since the field would just go unrecognized).
         let yaml = r#"
 materials:
-  - name: "Baltic Birch 3/4"
+  - species: "Baltic Birch"
     thickness_in: 0.75
 
 sheets:
@@ -204,15 +216,9 @@ sheets:
     }
 
     #[test]
-    fn distinct_materials_dedupes_by_name_preserving_first_appearance_order() {
-        let bb34 = Material {
-            name: "Baltic Birch 3/4".to_string(),
-            thickness_mm: 19.05,
-        };
-        let sande34 = Material {
-            name: "Sande Ply 3/4".to_string(),
-            thickness_mm: 19.05,
-        };
+    fn distinct_materials_dedupes_by_identity_preserving_first_appearance_order() {
+        let bb34 = Material::new("Baltic Birch", 19.05);
+        let sande34 = Material::new("Sande Ply", 19.05);
         let stock = vec![
             StockSheet {
                 material: bb34.clone(),
@@ -231,7 +237,7 @@ sheets:
             },
         ];
         let distinct = distinct_materials(&stock);
-        let names: Vec<&str> = distinct.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(names, vec!["Baltic Birch 3/4", "Sande Ply 3/4"]);
+        let names: Vec<String> = distinct.iter().map(|m| m.name()).collect();
+        assert_eq!(names, vec!["Baltic Birch 3/4\"", "Sande Ply 3/4\""]);
     }
 }

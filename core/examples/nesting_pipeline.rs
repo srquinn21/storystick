@@ -43,18 +43,9 @@ fn main() {
         .collect();
 
     // Mirrors scripts/stock.example.yaml.
-    let bb34 = Material {
-        name: "Baltic Birch 3/4 (finished 2 sides)".to_string(),
-        thickness_mm: 0.75 * MM_PER_IN,
-    };
-    let sande34 = Material {
-        name: "Sande Ply 3/4 (utility, unseen parts)".to_string(),
-        thickness_mm: 0.75 * MM_PER_IN,
-    };
-    let bb14 = Material {
-        name: "Baltic Birch 1/4".to_string(),
-        thickness_mm: 0.25 * MM_PER_IN,
-    };
+    let bb34 = Material::new("Baltic Birch", 0.75 * MM_PER_IN).with_finish("finished 2 sides");
+    let sande34 = Material::new("Sande Ply", 0.75 * MM_PER_IN).with_finish("utility, unseen parts");
+    let bb14 = Material::new("Baltic Birch", 0.25 * MM_PER_IN);
     let stock = vec![
         StockSheet {
             material: bb34,
@@ -81,7 +72,7 @@ fn main() {
     for line in &bom {
         println!(
             "{},{},{},{},{}",
-            line.stock.material.name,
+            line.stock.material.name(),
             line.stock.length_mm / MM_PER_IN,
             line.stock.width_mm / MM_PER_IN,
             line.stock.thickness_mm() / MM_PER_IN,
