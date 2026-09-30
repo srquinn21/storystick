@@ -189,10 +189,16 @@ pub enum CutKind {
 ///
 /// `position_mm` and `span_start_mm`/`span_end_mm` are measured from the
 /// same reference corner every `Placement.x_mm`/`y_mm` already is (see
-/// `crate::diagrams::mark_reference_corner`) -- so a cut's numbers stay
-/// meaningful as a story-stick-style measurement even once earlier cuts
-/// have physically separated the sheet, the same way a placement's own
-/// coordinates do.
+/// `crate::diagrams::mark_reference_corner`) -- exactly right for marking
+/// every cut line on the whole, still-intact sheet before making a
+/// single cut (see `crate::diagrams::render_rip_dimensions`), the same
+/// way a placement's own coordinates are right for a diagram of the
+/// finished layout. It is *not* a claim that this corner stays
+/// physically reachable cut after cut: the first cut that removes
+/// material between the corner and a later cut line takes that
+/// reachability with it. `cut_steps` turns this sheet-wide coordinate
+/// into the distance-from-the-piece-in-hand a woodworker actually needs
+/// for a step-by-step breakdown.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cut {
     pub kind: CutKind,
@@ -613,6 +619,219 @@ pub fn bill_of_materials<'a>(sheets: impl IntoIterator<Item = &'a SheetLayout>) 
         )
     });
     lines
+}
+
+/// Where a `CutStep`'s cut lands -- either the sheet itself (its very
+/// first cut), or a piece an earlier step in the same breakdown left for
+/// later (see `Outcome::Piece`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Sheet,
+    Piece(usize),
+}
+
+/// What one side of a `CutStep`'s cut turns out to be. `Piece` ids are
+/// only meaningful within one call's own result -- they number the
+/// pieces that still need a further cut, in the order this breakdown
+/// creates them, and every one is guaranteed to show up as some later
+/// step's own `Source::Piece` (see `cut_steps`'s docs): nothing here is
+/// numbered "to be cut later" and then never is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// Already a finished part -- nothing more to cut. Carries the same
+    /// label as the matching `Placement.part_label`.
+    Part(String),
+    /// Needs at least one more cut; some later step cuts it as
+    /// `Source::Piece(id)`.
+    Piece(usize),
+    /// Never cut again and never matches a placement -- scrap left over
+    /// once every part is out.
+    Offcut,
+}
+
+/// One cut, described the way it actually has to be executed: as a
+/// distance from the edge of the specific piece being cut, not from the
+/// sheet's own reference corner (see `Cut`'s own docs for why the two
+/// aren't the same thing past the first cut).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CutStep {
+    pub cut: Cut,
+    /// `cut.position_mm`'s distance from `source`'s own edge on the
+    /// cut's axis (its y_mm edge for a `Rip`, x_mm edge for a
+    /// `Crosscut`) -- always the edge every piece in this lineage traces
+    /// back toward the sheet's reference corner through, whether that's
+    /// the sheet's own true corner (the first cut made on a piece) or a
+    /// fresh edge an earlier cut in the same lineage left behind. Either
+    /// way, it's a real edge physically present on the piece in hand,
+    /// and consistently the same side -- so which edge to measure from
+    /// never depends on how deep into the breakdown a step is.
+    pub offset_mm: f64,
+    pub source: Source,
+    /// The two pieces this cut produces: `near` is the side on
+    /// `source`'s reference-corner-ward edge (what `offset_mm` cuts
+    /// off), `far` is everything past it.
+    pub near: Outcome,
+    pub far: Outcome,
+}
+
+/// Replays `sheet.cuts` -- which only records *where* each cut falls in
+/// the sheet's own fixed coordinates (see `Cut`'s docs) -- into the
+/// sequence a woodworker can actually follow: for each cut, which piece
+/// it lands on, how far from that piece's own edge, and what the cut
+/// leaves behind.
+///
+/// A rect this replay produces is classified in a *second* pass, once
+/// every cut has been replayed -- never inline, while replaying, even
+/// though a piece's `Outcome` looks decidable the moment it's created.
+/// The reason: a piece's corner (x0, y0) always exactly equals a
+/// placement's own (`Placement.x_mm`/`y_mm`), since a part is always
+/// placed flush with its free rect's own corner -- but that's just as
+/// true of a piece several cuts away from being that placement (its far
+/// edge is still whatever the *sheet* or an earlier strip left it,
+/// nowhere near the placement's true size) as it is of the one cut that
+/// actually finishes the job. Only "did any later cut ever need to
+/// divide this piece further" tells the two apart -- a leaf that never
+/// gets cut again either matches a placement's corner (a finished part)
+/// or it doesn't (scrap) -- and that's only knowable after the whole
+/// sheet's cuts have been replayed.
+pub fn cut_steps(sheet: &SheetLayout) -> Vec<CutStep> {
+    #[derive(Clone, Copy)]
+    struct Rect {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    }
+
+    struct OpenPiece {
+        id: Option<usize>, // None only for the sheet itself
+        rect: Rect,
+    }
+
+    /// One cut, replayed geometrically but not yet classified -- `near`/
+    /// `far` are just the piece ids `cut_steps` assigned, before knowing
+    /// whether each is a finished part, a piece needing more cuts, or
+    /// scrap.
+    struct RawStep {
+        cut: Cut,
+        offset_mm: f64,
+        source_id: Option<usize>,
+        near_id: usize,
+        far_id: usize,
+    }
+
+    const EPS: f64 = 1e-6;
+
+    let mut open = vec![OpenPiece {
+        id: None,
+        rect: Rect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: sheet.stock.length_mm,
+            y1: sheet.stock.width_mm,
+        },
+    }];
+    let mut rects: HashMap<usize, Rect> = HashMap::new();
+    let mut cut_further: HashSet<usize> = HashSet::new();
+    let mut next_id = 1usize;
+    let mut raw_steps: Vec<RawStep> = Vec::with_capacity(sheet.cuts.len());
+
+    for cut in &sheet.cuts {
+        let idx = open
+            .iter()
+            .position(|p| match cut.kind {
+                CutKind::Rip => {
+                    cut.position_mm > p.rect.y0 + EPS
+                        && cut.position_mm < p.rect.y1 - EPS
+                        && (cut.span_start_mm - p.rect.x0).abs() < EPS
+                        && (cut.span_end_mm - p.rect.x1).abs() < EPS
+                }
+                CutKind::Crosscut => {
+                    cut.position_mm > p.rect.x0 + EPS
+                        && cut.position_mm < p.rect.x1 - EPS
+                        && (cut.span_start_mm - p.rect.y0).abs() < EPS
+                        && (cut.span_end_mm - p.rect.y1).abs() < EPS
+                }
+            })
+            .expect("a recorded cut should always divide a piece this breakdown already produced");
+        let piece = open.remove(idx);
+        if let Some(id) = piece.id {
+            cut_further.insert(id);
+        }
+
+        let (offset_mm, near_rect, far_rect) = match cut.kind {
+            CutKind::Rip => (
+                cut.position_mm - piece.rect.y0,
+                Rect {
+                    y1: cut.position_mm,
+                    ..piece.rect
+                },
+                Rect {
+                    y0: cut.position_mm,
+                    ..piece.rect
+                },
+            ),
+            CutKind::Crosscut => (
+                cut.position_mm - piece.rect.x0,
+                Rect {
+                    x1: cut.position_mm,
+                    ..piece.rect
+                },
+                Rect {
+                    x0: cut.position_mm,
+                    ..piece.rect
+                },
+            ),
+        };
+
+        let mut alloc = |rect: Rect| -> usize {
+            let id = next_id;
+            next_id += 1;
+            rects.insert(id, rect);
+            open.push(OpenPiece { id: Some(id), rect });
+            id
+        };
+        let near_id = alloc(near_rect);
+        let far_id = alloc(far_rect);
+
+        raw_steps.push(RawStep {
+            cut: *cut,
+            offset_mm,
+            source_id: piece.id,
+            near_id,
+            far_id,
+        });
+    }
+
+    // Now that every cut has been replayed, `cut_further` says which
+    // ids were ever a later cut's source -- the only thing that tells a
+    // finished part apart from a piece merely sharing its corner (see
+    // this function's own docs).
+    let classify = |id: usize| -> Outcome {
+        if cut_further.contains(&id) {
+            return Outcome::Piece(id);
+        }
+        let rect = rects[&id];
+        match sheet
+            .placements
+            .iter()
+            .find(|p| (p.x_mm - rect.x0).abs() < EPS && (p.y_mm - rect.y0).abs() < EPS)
+        {
+            Some(p) => Outcome::Part(p.part_label.clone()),
+            None => Outcome::Offcut,
+        }
+    };
+
+    raw_steps
+        .into_iter()
+        .map(|r| CutStep {
+            cut: r.cut,
+            offset_mm: r.offset_mm,
+            source: r.source_id.map_or(Source::Sheet, Source::Piece),
+            near: classify(r.near_id),
+            far: classify(r.far_id),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1131,6 +1350,159 @@ mod tests {
         assert!(layout.unplaced.is_empty());
         for sheet in &layout.sheets {
             assert_cuts_isolate_every_placement(sheet);
+        }
+    }
+
+    #[test]
+    fn cut_steps_describes_each_cut_relative_to_the_piece_it_lands_on() {
+        // Same scenario as
+        // opening_a_strip_records_the_rip_that_frees_it_from_whatever_sheet_remains_above:
+        // a's leftover is too short for b, so b opens its own strip.
+        // Once b's strip is freed, the *sheet's* reference corner is
+        // gone from it -- its own rip, and a's own crosscut, must be
+        // described relative to the piece each one actually lands on.
+        let test_stock = StockSheet {
+            material: Material {
+                name: "test".to_string(),
+                thickness_mm: 19.0,
+            },
+            length_mm: 1000.0,
+            width_mm: 500.0,
+        };
+        let parts = vec![
+            PackablePart::new("a", 700.0, 200.0, 19.0),
+            PackablePart::new("b", 400.0, 150.0, 19.0),
+        ];
+        let layout = pack(&parts, &[test_stock], 0.0, 0.0);
+        assert!(layout.unplaced.is_empty());
+        let sheet = &layout.sheets[0];
+
+        let steps = cut_steps(sheet);
+        assert_eq!(steps.len(), 4);
+
+        assert_eq!(steps[0].source, Source::Sheet);
+        assert_eq!(steps[0].offset_mm, 200.0);
+        assert_eq!(steps[0].near, Outcome::Piece(1));
+        assert_eq!(steps[0].far, Outcome::Piece(2));
+
+        assert_eq!(
+            steps[1].source,
+            Source::Piece(1),
+            "a's crosscut lands on the piece step 0 cut off, not the sheet"
+        );
+        assert_eq!(steps[1].offset_mm, 700.0);
+        assert_eq!(steps[1].near, Outcome::Part("a".to_string()));
+        assert_eq!(steps[1].far, Outcome::Offcut);
+
+        assert_eq!(
+            steps[2].source,
+            Source::Piece(2),
+            "b's strip is ripped from the piece step 0 left over, not the sheet"
+        );
+        assert_eq!(
+            steps[2].offset_mm, 150.0,
+            "150mm from that piece's own edge, not 350mm from the sheet's corner"
+        );
+        assert_eq!(steps[2].near, Outcome::Piece(5));
+        assert_eq!(steps[2].far, Outcome::Offcut);
+
+        assert_eq!(steps[3].source, Source::Piece(5));
+        assert_eq!(
+            steps[3].offset_mm, 400.0,
+            "b's own length, from the edge of the piece it's actually cut from"
+        );
+        assert_eq!(steps[3].near, Outcome::Part("b".to_string()));
+        assert_eq!(steps[3].far, Outcome::Offcut);
+    }
+
+    #[test]
+    fn cut_steps_still_recognizes_a_finished_part_when_kerf_inflates_its_footprint() {
+        // A placement's *true* far edge sits kerf_mm short of the free
+        // rect it was actually carved from -- the gap is blade waste,
+        // never drawn as part of any piece (see `Cut`'s docs). Matching
+        // a leaf to a placement by full-rect equality (comparing the
+        // leaf's far edge too) would never fire once kerf_mm > 0; only
+        // matching by the corner they share is correct.
+        let test_stock = StockSheet {
+            material: Material {
+                name: "test".to_string(),
+                thickness_mm: 19.0,
+            },
+            length_mm: 1000.0,
+            width_mm: 500.0,
+        };
+        let parts = vec![
+            PackablePart::new("a", 700.0, 200.0, 19.0),
+            PackablePart::new("b", 400.0, 150.0, 19.0),
+        ];
+        let layout = pack(&parts, &[test_stock], 3.2, 0.0);
+        assert!(layout.unplaced.is_empty());
+        let sheet = &layout.sheets[0];
+
+        let steps = cut_steps(sheet);
+        let parts_seen: Vec<&str> = steps
+            .iter()
+            .flat_map(|s| [&s.near, &s.far])
+            .filter_map(|o| match o {
+                Outcome::Part(label) => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            parts_seen,
+            vec!["a", "b"],
+            "both parts should still be recognized as finished, despite kerf inflating every free rect's far edge"
+        );
+    }
+
+    #[test]
+    fn cut_steps_every_numbered_piece_is_addressed_by_a_later_step() {
+        let test_stock = StockSheet {
+            material: Material {
+                name: "test".to_string(),
+                thickness_mm: 19.0,
+            },
+            length_mm: 960.0,
+            width_mm: 480.0,
+        };
+        let parts = vec![
+            PackablePart::new("wide-a", 331.25, 290.0, 19.0),
+            PackablePart::new("wide-b", 331.25, 290.0, 19.0),
+            PackablePart::new("mid-a", 290.0, 288.75, 19.0),
+            PackablePart::new("mid-b", 290.0, 288.75, 19.0),
+            PackablePart::new("short-a", 310.0, 170.0, 19.0),
+            PackablePart::new("short-b", 310.0, 170.0, 19.0),
+            PackablePart::new("short-c", 310.0, 170.0, 19.0),
+        ];
+        let layout = pack(&parts, &[test_stock], 0.0, 0.0);
+        assert!(layout.unplaced.is_empty());
+
+        for sheet in &layout.sheets {
+            let steps = cut_steps(sheet);
+            for (i, step) in steps.iter().enumerate() {
+                for outcome in [&step.near, &step.far] {
+                    if let Outcome::Piece(id) = outcome {
+                        let addressed_later = steps[i + 1..]
+                            .iter()
+                            .any(|later| later.source == Source::Piece(*id));
+                        assert!(
+                            addressed_later,
+                            "piece {id} from step {i} is never cut again"
+                        );
+                    }
+                }
+            }
+            for placement in &sheet.placements {
+                let found = steps.iter().any(|step| {
+                    matches!(&step.near, Outcome::Part(l) if l == &placement.part_label)
+                        || matches!(&step.far, Outcome::Part(l) if l == &placement.part_label)
+                });
+                assert!(
+                    found,
+                    "{} never appears as a cut outcome",
+                    placement.part_label
+                );
+            }
         }
     }
 }

@@ -29,7 +29,9 @@
 //! computation below identical in spirit to the Python original instead of
 //! fighting two coordinate systems throughout.
 
-use crate::nesting::{bill_of_materials, BomLine, Cut, CutKind, Layout, SheetLayout};
+use crate::nesting::{
+    bill_of_materials, cut_steps, BomLine, CutKind, CutStep, Layout, Outcome, SheetLayout, Source,
+};
 use crate::units::format_mm_in;
 use printpdf::{
     BuiltinFont, Color, Line, LineDashPattern, LinePoint, Op, ParsedFont, PdfDocument,
@@ -822,57 +824,65 @@ fn render_sheet_page(
     page
 }
 
-/// One line of a sheet's Cut Instructions table: what to cut, and where,
-/// as an absolute measurement from the sheet's reference corner -- the
-/// same corner `mark_reference_corner` marks on the diagram and every
-/// `Cut`'s own coordinates are already relative to (see that type's
-/// docs) -- not a running offset from the previous cut, so a step can be
-/// read on its own without re-adding earlier steps.
-fn describe_cut(cut: &Cut, stock: &crate::nesting::StockSheet) -> String {
-    let is_full_span = |start: f64, end: f64, total: f64| start <= 1e-3 && end >= total - 1e-3;
-    match cut.kind {
-        CutKind::Rip => {
-            let extent = if is_full_span(cut.span_start_mm, cut.span_end_mm, stock.length_mm) {
-                "full length".to_string()
-            } else {
-                format!(
-                    "length {} to {}",
-                    format_mm_in(cut.span_start_mm),
-                    format_mm_in(cut.span_end_mm)
-                )
-            };
-            format!(
-                "Rip at {} from the reference corner (across the width) -- {extent}",
-                format_mm_in(cut.position_mm)
-            )
-        }
-        CutKind::Crosscut => {
-            let extent = if is_full_span(cut.span_start_mm, cut.span_end_mm, stock.width_mm) {
-                "full width".to_string()
-            } else {
-                format!(
-                    "width {} to {}",
-                    format_mm_in(cut.span_start_mm),
-                    format_mm_in(cut.span_end_mm)
-                )
-            };
-            format!(
-                "Crosscut at {} from the reference corner (across the length) -- {extent}",
-                format_mm_in(cut.position_mm)
-            )
-        }
+/// A piece a `CutStep` refers to, as a woodworker would point at it:
+/// the full sheet, a still-pending numbered piece, a finished part (by
+/// its Parts Index code), or scrap nothing further happens to.
+fn describe_source(source: &Source) -> String {
+    match source {
+        Source::Sheet => "the full sheet".to_string(),
+        Source::Piece(id) => format!("piece {id}"),
     }
 }
 
-/// A step-by-step breakdown of one sheet into `sheet.cuts`' order --
-/// every cut, rip and crosscut alike, not just the primary rips the
-/// diagram itself marks (see `render_rip_dimensions`) -- so the whole
-/// sheet can be broken down from this list alone, measurement by
-/// measurement, without re-reading the diagram. Skips sheets with no
-/// cuts at all (a single part that already is the whole sheet): there's
-/// nothing to instruct.
-fn render_cut_instructions_pages(sheet: &SheetLayout, metrics: &Metrics) -> Vec<Page> {
-    if sheet.cuts.is_empty() {
+fn describe_outcome(outcome: &Outcome, codes: &HashMap<String, String>) -> String {
+    match outcome {
+        Outcome::Part(label) => codes.get(label).cloned().unwrap_or_else(|| label.clone()),
+        Outcome::Piece(id) => format!("piece {id}"),
+        Outcome::Offcut => "an unused offcut".to_string(),
+    }
+}
+
+/// One line of a sheet's Cut Instructions table. Deliberately *not* an
+/// absolute measurement from the sheet's reference corner -- past the
+/// very first cut, that corner is gone from most of the pieces it once
+/// applied to (see `crate::nesting::CutStep`'s own docs). Every
+/// measurement here is instead the distance from the edge of whichever
+/// piece (`step.source`) this particular cut actually lands on, and
+/// every piece a step mentions is named clearly enough (a Parts Index
+/// code, a numbered piece, or "an unused offcut") that following the
+/// list start to finish never requires re-reading the diagram.
+fn describe_cut_step(step: &CutStep, codes: &HashMap<String, String>) -> String {
+    let source = describe_source(&step.source);
+    let near = describe_outcome(&step.near, codes);
+    let far = describe_outcome(&step.far, codes);
+    let offset = format_mm_in(step.offset_mm);
+    let axis = match step.cut.kind {
+        CutKind::Rip => "width",
+        CutKind::Crosscut => "length",
+    };
+    let verb = match step.cut.kind {
+        CutKind::Rip => "Rip",
+        CutKind::Crosscut => "Crosscut",
+    };
+    format!(
+        "On {source}: {verb} {offset} from its reference-corner edge, across the {axis} -- this cuts off {near}, leaving {far}."
+    )
+}
+
+/// A step-by-step breakdown of one sheet, each step named for the piece
+/// it actually cuts (see `describe_cut_step`) rather than the sheet's
+/// own corner -- so the whole sheet can be broken down from this list
+/// alone, piece in hand, without needing a measurement the previous cut
+/// already made physically impossible. Skips sheets with no cuts at all
+/// (a single part that already is the whole sheet): there's nothing to
+/// instruct.
+fn render_cut_instructions_pages(
+    sheet: &SheetLayout,
+    codes: &HashMap<String, String>,
+    metrics: &Metrics,
+) -> Vec<Page> {
+    let steps = cut_steps(sheet);
+    if steps.is_empty() {
         return Vec::new();
     }
     let title = format!(
@@ -880,11 +890,10 @@ fn render_cut_instructions_pages(sheet: &SheetLayout, metrics: &Metrics) -> Vec<
         sheet.stock.material.name,
         sheet.sheet_index + 1
     );
-    let rows: Vec<Vec<String>> = sheet
-        .cuts
+    let rows: Vec<Vec<String>> = steps
         .iter()
         .enumerate()
-        .map(|(i, cut)| vec![(i + 1).to_string(), describe_cut(cut, &sheet.stock)])
+        .map(|(i, step)| vec![(i + 1).to_string(), describe_cut_step(step, codes)])
         .collect();
     let step_w = rows
         .iter()
@@ -983,7 +992,7 @@ fn build_pages(
         for sheet in &sheets {
             pages.push(render_sheet_page(sheet, &codes, trim_allowance_mm, &metrics).finish());
             pages.extend(
-                render_cut_instructions_pages(sheet, &metrics)
+                render_cut_instructions_pages(sheet, &codes, &metrics)
                     .into_iter()
                     .map(Page::finish),
             );
@@ -1002,7 +1011,7 @@ fn build_pages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nesting::{Material, Placement, StockSheet};
+    use crate::nesting::{Cut, Material, Placement, StockSheet};
 
     fn test_stock() -> StockSheet {
         StockSheet {
@@ -1272,48 +1281,58 @@ mod tests {
     }
 
     #[test]
-    fn describe_cut_reports_a_full_span_rip_as_full_length() {
-        let stock = test_stock();
-        let cut = Cut {
-            kind: CutKind::Rip,
-            position_mm: 600.0,
-            span_start_mm: 0.0,
-            span_end_mm: stock.length_mm,
+    fn describe_cut_step_measures_from_the_source_pieces_own_edge_not_the_sheet() {
+        // A step whose source is a numbered piece (not Source::Sheet)
+        // must never read as an absolute measurement from the sheet's
+        // corner -- that corner isn't on this piece anymore.
+        let step = CutStep {
+            cut: Cut {
+                kind: CutKind::Rip,
+                position_mm: 600.0,
+                span_start_mm: 0.0,
+                span_end_mm: 900.0,
+            },
+            offset_mm: 150.0,
+            source: Source::Piece(2),
+            near: Outcome::Piece(3),
+            far: Outcome::Offcut,
         };
-        let description = describe_cut(&cut, &stock);
-        assert!(description.starts_with(&format!(
-            "Rip at {} from the reference corner",
-            format_mm_in(600.0)
+        let description = describe_cut_step(&step, &HashMap::new());
+        assert!(description.starts_with("On piece 2:"));
+        assert!(description.contains(&format!(
+            "Rip {} from its reference-corner edge",
+            format_mm_in(150.0)
         )));
-        assert!(description.ends_with("full length"));
+        assert!(description.contains("cuts off piece 3"));
+        assert!(description.contains("leaving an unused offcut"));
     }
 
     #[test]
-    fn describe_cut_reports_a_partial_span_crosscut_with_its_extent() {
-        let stock = test_stock();
-        let cut = Cut {
-            kind: CutKind::Crosscut,
-            position_mm: 800.0,
-            span_start_mm: 0.0,
-            span_end_mm: 400.0,
+    fn describe_cut_step_reports_a_finished_part_by_its_code() {
+        let step = CutStep {
+            cut: Cut {
+                kind: CutKind::Crosscut,
+                position_mm: 700.0,
+                span_start_mm: 0.0,
+                span_end_mm: 200.0,
+            },
+            offset_mm: 700.0,
+            source: Source::Sheet,
+            near: Outcome::Part("Bench / Body A".to_string()),
+            far: Outcome::Piece(1),
         };
-        let description = describe_cut(&cut, &stock);
-        assert!(description.starts_with(&format!(
-            "Crosscut at {} from the reference corner",
-            format_mm_in(800.0)
-        )));
-        assert!(description.ends_with(&format!(
-            "width {} to {}",
-            format_mm_in(0.0),
-            format_mm_in(400.0)
-        )));
+        let mut codes = HashMap::new();
+        codes.insert("Bench / Body A".to_string(), "P001".to_string());
+        let description = describe_cut_step(&step, &codes);
+        assert!(description.starts_with("On the full sheet:"));
+        assert!(description.contains("cuts off P001"));
     }
 
     #[test]
     fn render_cut_instructions_pages_is_empty_for_a_sheet_with_no_cuts() {
         let sheet = sheet_layout(vec![placement("Bench / Body A", 0.0, 0.0, 762.0, 438.0)]);
         let metrics = Metrics::new();
-        assert!(render_cut_instructions_pages(&sheet, &metrics).is_empty());
+        assert!(render_cut_instructions_pages(&sheet, &HashMap::new(), &metrics).is_empty());
     }
 
     #[test]
@@ -1326,7 +1345,10 @@ mod tests {
             span_end_mm: sheet.stock.length_mm,
         }];
         let metrics = Metrics::new();
-        assert_eq!(render_cut_instructions_pages(&sheet, &metrics).len(), 1);
+        assert_eq!(
+            render_cut_instructions_pages(&sheet, &HashMap::new(), &metrics).len(),
+            1
+        );
     }
 
     #[test]
