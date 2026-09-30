@@ -29,7 +29,7 @@
 //! computation below identical in spirit to the Python original instead of
 //! fighting two coordinate systems throughout.
 
-use crate::nesting::{bill_of_materials, BomLine, Layout, SheetLayout};
+use crate::nesting::{bill_of_materials, BomLine, Cut, CutKind, Layout, SheetLayout};
 use crate::units::format_mm_in;
 use printpdf::{
     BuiltinFont, Color, Line, LineDashPattern, LinePoint, Op, ParsedFont, PdfDocument,
@@ -48,6 +48,12 @@ const MM_PER_PT: f64 = 25.4 / 72.0;
 // already-validated case keeps its full label; only genuinely smaller
 // parts (a small cleat, etc.) fall back.
 const LABEL_MIN_HEIGHT_MM: f64 = 9.0;
+
+/// Extra room reserved along a sheet diagram's left edge for the primary
+/// rip cuts' dimension ticks (see `render_rip_dimensions`) -- only
+/// reserved when a sheet actually has one; a single-strip sheet keeps
+/// the full page for its diagram, same as before this existed.
+const RIP_DIM_GUTTER_MM: f64 = 14.0;
 
 fn leaf(full_path: &str) -> &str {
     full_path.rsplit(" / ").next().unwrap_or(full_path)
@@ -639,6 +645,60 @@ fn on_sheet_label(code: &str, leaf: &str, height_mm: f64, dims_line: &str) -> St
     }
 }
 
+/// A sheet's primary rip cuts -- the ones that carve it into strips,
+/// spanning its full length_mm (see `core::nesting`'s module docs) -- as
+/// opposed to the narrower rips/crosscuts a strip's own internal packing
+/// can also produce. These are the "important key cutlines" worth
+/// marking directly on the diagram (see `render_rip_dimensions`); every
+/// cut, of either kind, still gets its own line in the Cut Instructions
+/// list (`render_cut_instructions_pages`).
+fn primary_rip_positions(sheet: &SheetLayout) -> Vec<f64> {
+    sheet
+        .cuts
+        .iter()
+        .filter(|c| {
+            c.kind == CutKind::Rip
+                && c.span_end_mm - c.span_start_mm >= sheet.stock.length_mm - 1e-3
+        })
+        .map(|c| c.position_mm)
+        .collect()
+}
+
+/// Dimension ticks in the gutter reserved by `render_sheet_page`, one per
+/// primary rip: a tick on the sheet's own edge, and a label giving that
+/// rip's distance from the reference corner (the same corner
+/// `mark_reference_corner` marks, and every Placement's own x_mm/y_mm is
+/// already measured from) -- a story-stick-style absolute measurement,
+/// not a segment length between consecutive rips.
+fn render_rip_dimensions(
+    page: &mut Page,
+    origin_x: f64,
+    origin_y: f64,
+    scale: f64,
+    positions: &[f64],
+    metrics: &Metrics,
+) {
+    const FONT_PT: f64 = 6.0;
+    let tick_x = origin_x - 3.0;
+    page.set_stroke(90, 90, 90);
+    page.set_line_width_mm(0.2);
+    for &position_mm in positions {
+        let y = origin_y + position_mm * scale;
+        page.line(tick_x, y, origin_x, y);
+        let label = format_mm_in(position_mm);
+        let label_w = metrics.width_mm(&label, FONT_PT, false);
+        page.text(
+            tick_x - 1.0 - label_w,
+            y + FONT_PT * 0.3,
+            &label,
+            false,
+            FONT_PT,
+        );
+    }
+    page.set_stroke(0, 0, 0);
+    page.set_line_width_mm(0.2);
+}
+
 fn render_sheet_page(
     sheet: &SheetLayout,
     codes: &HashMap<String, String>,
@@ -654,12 +714,19 @@ fn render_sheet_page(
     };
     let mut page = Page::new(page_w, page_h);
 
+    let rip_positions = primary_rip_positions(sheet);
+    let gutter = if rip_positions.is_empty() {
+        0.0
+    } else {
+        RIP_DIM_GUTTER_MM
+    };
+
     let title_h = 12.0;
-    let usable_w = page_w - 2.0 * MARGIN_MM;
+    let usable_w = page_w - 2.0 * MARGIN_MM - gutter;
     let usable_h = page_h - 2.0 * MARGIN_MM - title_h;
     let scale = (usable_w / stock.length_mm).min(usable_h / stock.width_mm);
 
-    let origin_x = MARGIN_MM;
+    let origin_x = MARGIN_MM + gutter;
     let origin_y = MARGIN_MM + title_h;
 
     let title = format!(
@@ -744,7 +811,99 @@ fn render_sheet_page(
     }
 
     mark_reference_corner(&mut page, origin_x, origin_y, 5.0);
+    render_rip_dimensions(
+        &mut page,
+        origin_x,
+        origin_y,
+        scale,
+        &rip_positions,
+        metrics,
+    );
     page
+}
+
+/// One line of a sheet's Cut Instructions table: what to cut, and where,
+/// as an absolute measurement from the sheet's reference corner -- the
+/// same corner `mark_reference_corner` marks on the diagram and every
+/// `Cut`'s own coordinates are already relative to (see that type's
+/// docs) -- not a running offset from the previous cut, so a step can be
+/// read on its own without re-adding earlier steps.
+fn describe_cut(cut: &Cut, stock: &crate::nesting::StockSheet) -> String {
+    let is_full_span = |start: f64, end: f64, total: f64| start <= 1e-3 && end >= total - 1e-3;
+    match cut.kind {
+        CutKind::Rip => {
+            let extent = if is_full_span(cut.span_start_mm, cut.span_end_mm, stock.length_mm) {
+                "full length".to_string()
+            } else {
+                format!(
+                    "length {} to {}",
+                    format_mm_in(cut.span_start_mm),
+                    format_mm_in(cut.span_end_mm)
+                )
+            };
+            format!(
+                "Rip at {} from the reference corner (across the width) -- {extent}",
+                format_mm_in(cut.position_mm)
+            )
+        }
+        CutKind::Crosscut => {
+            let extent = if is_full_span(cut.span_start_mm, cut.span_end_mm, stock.width_mm) {
+                "full width".to_string()
+            } else {
+                format!(
+                    "width {} to {}",
+                    format_mm_in(cut.span_start_mm),
+                    format_mm_in(cut.span_end_mm)
+                )
+            };
+            format!(
+                "Crosscut at {} from the reference corner (across the length) -- {extent}",
+                format_mm_in(cut.position_mm)
+            )
+        }
+    }
+}
+
+/// A step-by-step breakdown of one sheet into `sheet.cuts`' order --
+/// every cut, rip and crosscut alike, not just the primary rips the
+/// diagram itself marks (see `render_rip_dimensions`) -- so the whole
+/// sheet can be broken down from this list alone, measurement by
+/// measurement, without re-reading the diagram. Skips sheets with no
+/// cuts at all (a single part that already is the whole sheet): there's
+/// nothing to instruct.
+fn render_cut_instructions_pages(sheet: &SheetLayout, metrics: &Metrics) -> Vec<Page> {
+    if sheet.cuts.is_empty() {
+        return Vec::new();
+    }
+    let title = format!(
+        "Cut Sequence -- {} #{}",
+        sheet.stock.material.name,
+        sheet.sheet_index + 1
+    );
+    let rows: Vec<Vec<String>> = sheet
+        .cuts
+        .iter()
+        .enumerate()
+        .map(|(i, cut)| vec![(i + 1).to_string(), describe_cut(cut, &sheet.stock)])
+        .collect();
+    let step_w = rows
+        .iter()
+        .map(|r| metrics.width_mm(&r[0], 11.0, false))
+        .fold(metrics.width_mm("Step", 11.0, false), f64::max)
+        + 4.0;
+    let landscape = sheet.stock.length_mm >= sheet.stock.width_mm;
+    let page_w = if landscape { LETTER_H_MM } else { LETTER_W_MM };
+
+    render_table_pages(&TableSpec {
+        title,
+        headers: vec!["Step".to_string(), "Cut".to_string()],
+        widths: vec![step_w, page_w - 2.0 * MARGIN_MM - step_w],
+        rows,
+        font_size_pt: 11.0,
+        row_h_mm: 8.0,
+        landscape,
+        notes: false,
+    })
 }
 
 /// One PDF, organized for shop assembly (one construction stage at a
@@ -754,13 +913,16 @@ fn render_sheet_page(
 /// 2. Per construction-stage section (see `group_sheets_by_section`), in
 ///    build order: a front page (section title, that section's own BOM,
 ///    and a blank ruled Notes area -- these plans travel on a clipboard
-///    in the shop, so there's always room to write on one), that
-///    section's own cut-sheet pages, and that section's own Parts Index.
-///    Parts Index codes (P001, P002, ...) restart at P001 within each
-///    section rather than counting up across the whole project, since a
-///    section's index only ever needs to cross-reference that same
-///    section's own sheet pages -- assembly happens one section at a
-///    time, so there's no reason to search a global list.
+///    in the shop, so there's always room to write on one), then for
+///    each of that section's sheets, its own cut-sheet diagram
+///    immediately followed by its own Cut Instructions page (see
+///    `render_cut_instructions_pages`), and finally that section's own
+///    Parts Index. Parts Index codes (P001, P002, ...) restart at P001
+///    within each section rather than counting up across the whole
+///    project, since a section's index only ever needs to
+///    cross-reference that same section's own sheet pages -- assembly
+///    happens one section at a time, so there's no reason to search a
+///    global list.
 ///
 /// No dedicated section title page: the front page already carries the
 /// title alongside content worth the paper (its own BOM), so a
@@ -820,6 +982,11 @@ fn build_pages(
         let (codes, dims) = assign_codes(sheets.iter().copied());
         for sheet in &sheets {
             pages.push(render_sheet_page(sheet, &codes, trim_allowance_mm, &metrics).finish());
+            pages.extend(
+                render_cut_instructions_pages(sheet, &metrics)
+                    .into_iter()
+                    .map(Page::finish),
+            );
         }
         let index_title = format!("Parts Index -- {label}");
         pages.extend(
@@ -837,18 +1004,23 @@ mod tests {
     use super::*;
     use crate::nesting::{Material, Placement, StockSheet};
 
+    fn test_stock() -> StockSheet {
+        StockSheet {
+            material: Material {
+                name: "Baltic Birch 3/4".to_string(),
+                thickness_mm: 19.05,
+            },
+            length_mm: 2438.4,
+            width_mm: 1219.2,
+        }
+    }
+
     fn sheet_layout(placements: Vec<Placement>) -> SheetLayout {
         SheetLayout {
-            stock: StockSheet {
-                material: Material {
-                    name: "Baltic Birch 3/4".to_string(),
-                    thickness_mm: 19.05,
-                },
-                length_mm: 2438.4,
-                width_mm: 1219.2,
-            },
+            stock: test_stock(),
             sheet_index: 0,
             placements,
+            cuts: Vec::new(),
         }
     }
 
@@ -1097,5 +1269,97 @@ mod tests {
             2,
             "the notes box should open its own page rather than squeeze in"
         );
+    }
+
+    #[test]
+    fn describe_cut_reports_a_full_span_rip_as_full_length() {
+        let stock = test_stock();
+        let cut = Cut {
+            kind: CutKind::Rip,
+            position_mm: 600.0,
+            span_start_mm: 0.0,
+            span_end_mm: stock.length_mm,
+        };
+        let description = describe_cut(&cut, &stock);
+        assert!(description.starts_with(&format!(
+            "Rip at {} from the reference corner",
+            format_mm_in(600.0)
+        )));
+        assert!(description.ends_with("full length"));
+    }
+
+    #[test]
+    fn describe_cut_reports_a_partial_span_crosscut_with_its_extent() {
+        let stock = test_stock();
+        let cut = Cut {
+            kind: CutKind::Crosscut,
+            position_mm: 800.0,
+            span_start_mm: 0.0,
+            span_end_mm: 400.0,
+        };
+        let description = describe_cut(&cut, &stock);
+        assert!(description.starts_with(&format!(
+            "Crosscut at {} from the reference corner",
+            format_mm_in(800.0)
+        )));
+        assert!(description.ends_with(&format!(
+            "width {} to {}",
+            format_mm_in(0.0),
+            format_mm_in(400.0)
+        )));
+    }
+
+    #[test]
+    fn render_cut_instructions_pages_is_empty_for_a_sheet_with_no_cuts() {
+        let sheet = sheet_layout(vec![placement("Bench / Body A", 0.0, 0.0, 762.0, 438.0)]);
+        let metrics = Metrics::new();
+        assert!(render_cut_instructions_pages(&sheet, &metrics).is_empty());
+    }
+
+    #[test]
+    fn render_cut_instructions_pages_produces_a_page_for_a_sheet_with_cuts() {
+        let mut sheet = sheet_layout(vec![placement("Bench / Body A", 0.0, 0.0, 762.0, 438.0)]);
+        sheet.cuts = vec![Cut {
+            kind: CutKind::Rip,
+            position_mm: 438.0,
+            span_start_mm: 0.0,
+            span_end_mm: sheet.stock.length_mm,
+        }];
+        let metrics = Metrics::new();
+        assert_eq!(render_cut_instructions_pages(&sheet, &metrics).len(), 1);
+    }
+
+    #[test]
+    fn build_pages_adds_one_instructions_page_per_sheet_that_has_cuts() {
+        let mut with_cuts = sheet_layout(vec![placement(
+            "Bench / Left / Body A",
+            0.0,
+            0.0,
+            762.0,
+            438.0,
+        )]);
+        with_cuts.cuts = vec![Cut {
+            kind: CutKind::Rip,
+            position_mm: 438.0,
+            span_start_mm: 0.0,
+            span_end_mm: with_cuts.stock.length_mm,
+        }];
+        let without_cuts = sheet_layout(vec![placement(
+            "Bench / Left / Body B",
+            0.0,
+            0.0,
+            762.0,
+            438.0,
+        )]);
+        let layout = Layout {
+            sheets: vec![with_cuts, without_cuts],
+            unplaced: vec![],
+        };
+
+        let pages = build_pages(&layout, 0.0, |_| None, "Unsectioned");
+
+        // global BOM + front page + (sheet + instructions) + sheet (no
+        // instructions) + index.
+        assert_eq!(pages.len(), 1 + 1 + 2 + 1 + 1);
     }
 }

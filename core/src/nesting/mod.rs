@@ -170,6 +170,60 @@ pub struct Placement {
     pub rotated: bool,
 }
 
+/// A cut holds one coordinate fixed and runs across the other -- `Rip`
+/// fixes a y_mm (position across the sheet's width) and runs along
+/// length_mm, same as the strip-defining rip this module is named for;
+/// `Crosscut` fixes an x_mm (position along length_mm) and runs along
+/// width_mm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutKind {
+    Rip,
+    Crosscut,
+}
+
+/// One straight guillotine cut. `cuts` on `SheetLayout` lists these in
+/// the order they must actually be made: each cut only ever divides a
+/// board that the cuts before it already produced (see `pack`'s docs),
+/// so working through the list in order is always physically executable,
+/// never "cut a piece that isn't isolated yet."
+///
+/// `position_mm` and `span_start_mm`/`span_end_mm` are measured from the
+/// same reference corner every `Placement.x_mm`/`y_mm` already is (see
+/// `crate::diagrams::mark_reference_corner`) -- so a cut's numbers stay
+/// meaningful as a story-stick-style measurement even once earlier cuts
+/// have physically separated the sheet, the same way a placement's own
+/// coordinates do.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cut {
+    pub kind: CutKind,
+    /// The fixed coordinate: y_mm for a `Rip`, x_mm for a `Crosscut`.
+    pub position_mm: f64,
+    /// The cut's extent along the other axis: x_mm range for a `Rip`,
+    /// y_mm range for a `Crosscut`.
+    pub span_start_mm: f64,
+    pub span_end_mm: f64,
+}
+
+impl Cut {
+    fn rip(position_mm: f64, span_start_mm: f64, span_end_mm: f64) -> Self {
+        Self {
+            kind: CutKind::Rip,
+            position_mm,
+            span_start_mm,
+            span_end_mm,
+        }
+    }
+
+    fn crosscut(position_mm: f64, span_start_mm: f64, span_end_mm: f64) -> Self {
+        Self {
+            kind: CutKind::Crosscut,
+            position_mm,
+            span_start_mm,
+            span_end_mm,
+        }
+    }
+}
+
 /// One physical sheet (the `sheet_index`-th copy of `stock` used) and
 /// everything placed on it.
 #[derive(Debug, Clone, PartialEq)]
@@ -177,6 +231,9 @@ pub struct SheetLayout {
     pub stock: StockSheet,
     pub sheet_index: usize,
     pub placements: Vec<Placement>,
+    /// Every cut needed to break this sheet down into `placements`, in
+    /// execution order -- see `Cut`'s own docs.
+    pub cuts: Vec<Cut>,
 }
 
 /// The full result of a `pack` call: every sheet used, plus any parts
@@ -228,6 +285,10 @@ struct SheetInProgress {
     sheet_index: usize,
     used_width_mm: f64,
     strips: Vec<Strip>,
+    /// Every cut made on this sheet so far, across all its strips, in the
+    /// order `place_on_candidate` made them -- see `Cut`'s own docs for
+    /// why call order alone is already a valid execution order.
+    cuts: Vec<Cut>,
 }
 
 /// Index of the smallest-area free rect (within one strip) that fits
@@ -251,25 +312,46 @@ fn best_fit_free_rect(free_rects: &[FreeRect], length: f64, width: f64) -> Optio
 /// attached to the placed piece's row/column, the larger one becomes its
 /// own free rect). Safe in either split orientation -- this free rect
 /// already belongs to an isolated strip, never the original full sheet.
+///
+/// Appends the 0-2 cuts this split actually requires to `cuts`, in the
+/// order they must be made: first the cut that separates the placed
+/// piece's whole row/column (piece + its attached leftover) from the
+/// other, standalone leftover -- that one spans the free rect's full
+/// original extent, since nothing has been cut from it yet -- then, only
+/// if there is an attached leftover at all, the second cut that splits
+/// the placed piece off it. A piece that exactly fills its free rect
+/// needs neither.
+///
 /// Returns the piece's placement origin (x, y).
 fn split_free_rect(
     free_rects: &mut Vec<FreeRect>,
     index: usize,
     length: f64,
     width: f64,
+    cuts: &mut Vec<Cut>,
 ) -> (f64, f64) {
     let (fx, fy, fw, fh) = free_rects.remove(index);
     let right_w = fw - length;
     let top_h = fh - width;
     if right_w <= top_h {
+        // Row (piece + right leftover) vs. the standalone top leftover.
+        if top_h > 1e-6 {
+            cuts.push(Cut::rip(fy + width, fx, fx + fw));
+        }
         if right_w > 1e-6 {
+            cuts.push(Cut::crosscut(fx + length, fy, fy + width));
             free_rects.push((fx + length, fy, right_w, width));
         }
         if top_h > 1e-6 {
             free_rects.push((fx, fy + width, fw, top_h));
         }
     } else {
+        // Column (piece + top leftover) vs. the standalone right leftover.
+        if right_w > 1e-6 {
+            cuts.push(Cut::crosscut(fx + length, fy, fy + fh));
+        }
         if top_h > 1e-6 {
+            cuts.push(Cut::rip(fy + width, fx, fx + length));
             free_rects.push((fx, fy + width, length, top_h));
         }
         if right_w > 1e-6 {
@@ -345,11 +427,22 @@ fn place_on_candidate(
                             sheet_index: sheets.len(),
                             used_width_mm: 0.0,
                             strips: Vec::new(),
+                            cuts: Vec::new(),
                         });
                         sheets.len() - 1
                     }
                 };
                 let y_mm = sheets[si].used_width_mm;
+                let strip_top = y_mm + width;
+                // The rip that frees this new strip from whatever sheet
+                // remains above it -- skipped when the strip reaches the
+                // sheet's own top edge, since there's no remainder left
+                // to separate.
+                if strip_top < candidate.width_mm - 1e-6 {
+                    sheets[si]
+                        .cuts
+                        .push(Cut::rip(strip_top, 0.0, candidate.length_mm));
+                }
                 sheets[si].strips.push(Strip {
                     y_mm,
                     width_mm: width,
@@ -361,8 +454,15 @@ fn place_on_candidate(
             }
         };
 
-        let (x, y) = split_free_rect(&mut sheets[si].strips[ti].free_rects, fi, length, width);
-        sheets[si].strips[ti].placements.push(Placement {
+        let sheet = &mut sheets[si];
+        let (x, y) = split_free_rect(
+            &mut sheet.strips[ti].free_rects,
+            fi,
+            length,
+            width,
+            &mut sheet.cuts,
+        );
+        sheet.strips[ti].placements.push(Placement {
             part_label: part.label.clone(),
             x_mm: x,
             y_mm: y,
@@ -461,6 +561,7 @@ pub fn pack(
                     stock: candidate.clone(),
                     sheet_index: idx,
                     placements,
+                    cuts: sheet.cuts,
                 });
             }
 
@@ -839,5 +940,197 @@ mod tests {
             2,
             "the short group should reuse the two sheets already open, not strand a third"
         );
+    }
+
+    #[test]
+    fn opening_a_strip_records_the_rip_that_frees_it_from_whatever_sheet_remains_above() {
+        // a's leftover (700..1000 long, 200 tall) is too short for b's
+        // 400mm length, so b can't reuse it and opens its own strip --
+        // each strip's own opening then records the rip that frees it
+        // from the sheet remaining above it at the time.
+        let test_stock = StockSheet {
+            material: Material {
+                name: "test".to_string(),
+                thickness_mm: 19.0,
+            },
+            length_mm: 1000.0,
+            width_mm: 500.0,
+        };
+        let parts = vec![
+            (0usize, PackablePart::new("a", 700.0, 200.0, 19.0)),
+            (1usize, PackablePart::new("b", 400.0, 150.0, 19.0)),
+        ];
+
+        let (sheets, placed_ids) = place_on_candidate(&parts, &test_stock, 0.0);
+
+        assert_eq!(placed_ids.len(), 2);
+        assert_eq!(
+            sheets[0].strips.len(),
+            2,
+            "b can't reuse a's leftover, so it opens its own strip"
+        );
+        assert_eq!(
+            sheets[0].cuts,
+            vec![
+                Cut::rip(200.0, 0.0, 1000.0),
+                Cut::crosscut(700.0, 0.0, 200.0),
+                Cut::rip(350.0, 0.0, 1000.0),
+                Cut::crosscut(400.0, 200.0, 350.0),
+            ],
+            "each strip's opening rip is followed by the crosscut that trims its part off the strip's own leftover"
+        );
+    }
+
+    #[test]
+    fn a_strip_reaching_the_sheets_top_edge_needs_no_closing_rip() {
+        let test_stock = StockSheet {
+            material: Material {
+                name: "test".to_string(),
+                thickness_mm: 19.0,
+            },
+            length_mm: 1000.0,
+            width_mm: 500.0,
+        };
+        let part = (0usize, PackablePart::new("full-sheet", 1000.0, 500.0, 19.0));
+
+        let (sheets, _) = place_on_candidate(&[part], &test_stock, 0.0);
+
+        assert!(
+            sheets[0].cuts.is_empty(),
+            "a part exactly matching the sheet needs neither a strip-opening rip nor a split cut"
+        );
+    }
+
+    #[test]
+    fn a_part_exactly_filling_its_free_rect_needs_no_cut() {
+        let test_stock = StockSheet {
+            material: Material {
+                name: "test".to_string(),
+                thickness_mm: 19.0,
+            },
+            length_mm: 400.0,
+            width_mm: 200.0,
+        };
+        let part = (0usize, PackablePart::new("exact", 400.0, 200.0, 19.0));
+
+        let (sheets, _) = place_on_candidate(&[part], &test_stock, 0.0);
+
+        assert!(
+            sheets[0].cuts.is_empty(),
+            "a part matching the whole sheet needs no cut to isolate it"
+        );
+    }
+
+    /// Replays `sheet.cuts` against a simulated full sheet -- starting
+    /// from one board the size of the whole sheet, each cut must divide
+    /// some board already on the table into two, in guillotine fashion
+    /// (edge to edge across whichever board it lands in) -- then checks
+    /// that every placement ends up as its own standalone board. This is
+    /// the real correctness property `cuts` needs: not just "the right
+    /// positions," but "actually executable, in this order, and
+    /// sufficient to free every part." Callers must pack with zero
+    /// kerf/trim allowance so a placement's true dims match its isolated
+    /// board's dims exactly.
+    fn assert_cuts_isolate_every_placement(sheet: &SheetLayout) {
+        #[derive(Clone, Copy, Debug)]
+        struct Board {
+            x0: f64,
+            y0: f64,
+            x1: f64,
+            y1: f64,
+        }
+        const EPS: f64 = 1e-6;
+
+        let mut boards = vec![Board {
+            x0: 0.0,
+            y0: 0.0,
+            x1: sheet.stock.length_mm,
+            y1: sheet.stock.width_mm,
+        }];
+        for cut in &sheet.cuts {
+            let idx = boards
+                .iter()
+                .position(|b| match cut.kind {
+                    CutKind::Rip => {
+                        cut.position_mm > b.y0 + EPS
+                            && cut.position_mm < b.y1 - EPS
+                            && (cut.span_start_mm - b.x0).abs() < EPS
+                            && (cut.span_end_mm - b.x1).abs() < EPS
+                    }
+                    CutKind::Crosscut => {
+                        cut.position_mm > b.x0 + EPS
+                            && cut.position_mm < b.x1 - EPS
+                            && (cut.span_start_mm - b.y0).abs() < EPS
+                            && (cut.span_end_mm - b.y1).abs() < EPS
+                    }
+                })
+                .unwrap_or_else(|| {
+                    panic!("{cut:?} doesn't divide any board on the table: {boards:?}")
+                });
+            let b = boards.remove(idx);
+            match cut.kind {
+                CutKind::Rip => {
+                    boards.push(Board {
+                        y1: cut.position_mm,
+                        ..b
+                    });
+                    boards.push(Board {
+                        y0: cut.position_mm,
+                        ..b
+                    });
+                }
+                CutKind::Crosscut => {
+                    boards.push(Board {
+                        x1: cut.position_mm,
+                        ..b
+                    });
+                    boards.push(Board {
+                        x0: cut.position_mm,
+                        ..b
+                    });
+                }
+            }
+        }
+
+        for p in &sheet.placements {
+            let isolated = boards.iter().any(|b| {
+                (b.x0 - p.x_mm).abs() < EPS
+                    && (b.y0 - p.y_mm).abs() < EPS
+                    && (b.x1 - (p.x_mm + p.length_mm)).abs() < EPS
+                    && (b.y1 - (p.y_mm + p.width_mm)).abs() < EPS
+            });
+            assert!(
+                isolated,
+                "placement {p:?} was never isolated as its own board by replaying cuts in order"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_produces_a_cut_sequence_that_isolates_every_placement() {
+        let test_stock = StockSheet {
+            material: Material {
+                name: "test".to_string(),
+                thickness_mm: 19.0,
+            },
+            length_mm: 960.0,
+            width_mm: 480.0,
+        };
+        let parts = vec![
+            PackablePart::new("wide-a", 331.25, 290.0, 19.0),
+            PackablePart::new("wide-b", 331.25, 290.0, 19.0),
+            PackablePart::new("mid-a", 290.0, 288.75, 19.0),
+            PackablePart::new("mid-b", 290.0, 288.75, 19.0),
+            PackablePart::new("short-a", 310.0, 170.0, 19.0),
+            PackablePart::new("short-b", 310.0, 170.0, 19.0),
+            PackablePart::new("short-c", 310.0, 170.0, 19.0),
+        ];
+
+        let layout = pack(&parts, &[test_stock], 0.0, 0.0);
+
+        assert!(layout.unplaced.is_empty());
+        for sheet in &layout.sheets {
+            assert_cuts_isolate_every_placement(sheet);
+        }
     }
 }
