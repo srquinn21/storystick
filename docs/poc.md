@@ -28,7 +28,7 @@ folders, and folders nested into subfolders; the STEP export reflects
 that nesting directly, and storystick's parts tree mirrors it exactly
 (see `cli/src/review/tree.rs`).
 
-storystick's job is purely to *decorate* that structure: assign
+storystick's job is purely to _decorate_ that structure: assign
 material, and generate a cutlist, bill of materials, and project plan
 from it. It never edits geometry or part organization -- that discipline
 stays entirely on the Shapr3D side. Practically, this means: prefer a
@@ -97,7 +97,7 @@ section, without giving up the "review one export at a time" habit.
 Idea: a `project.yaml` manifest listing STEP files (sections) in build
 order, plus a project-scoped stock subset (materials "added" to the
 project from the global catalog); sections auto-detected via a
-`{filename}-{label}.step` naming convention (split on the *last*
+`{filename}-{label}.step` naming convention (split on the _last_
 hyphen, so a base name that itself contains hyphens, like "Built-In",
 still works); running `storystick` with no path in a directory would
 create the manifest if missing (an interactive "create experience":
@@ -109,7 +109,7 @@ storystick problem, exactly the aggregation that a single load would get
 for free -- and a manifest plus multiple sidecars is more moving parts
 (more places to drift out of sync) in service of a habit (reviewing one
 chunk of the model at a time) that doesn't actually require multiple
-*files*, just a tree big enough to review in chunks. See "Tree UX at
+_files_, just a tree big enough to review in chunks. See "Tree UX at
 project scale" below.
 
 This idea's shape (a `project.yaml`, discovered by directory, with a
@@ -150,7 +150,7 @@ Originally: a global stock-catalog `match:` list per material seeded an
 autofill guess, and a per-STEP sidecar held per-part overrides
 (material/swap), with a tri-state (never-decided / explicitly-cleared /
 assigned) so a rejected guess wouldn't just come back next run. Both
-ideas got superseded once bulk-edit (below) made a *project-scoped*,
+ideas got superseded once bulk-edit (below) made a _project-scoped_,
 user-authored rule the primary mechanism instead of a guess:
 
 - **`match:` moved off the global catalog and into a per-project
@@ -170,7 +170,7 @@ user-authored rule the primary mechanism instead of a guess:
 - **A part's material resolves as: its own exception, if any; else its
   tag's rule, if any; else unassigned, flagged** (`review::resolve_material`).
   This replaces the old tri-state entirely -- there's no longer a
-  distinct "explicitly no material" state to hold in reserve on *either*
+  distinct "explicitly no material" state to hold in reserve on _either_
   side. Clearing a part's exception just deletes it and re-resolves from
   the current rule (or unassigned); clearing a tag's rule in bulk-edit
   just deletes that rule entry. A part with no tag and no rule that gets
@@ -191,7 +191,7 @@ user-authored rule the primary mechanism instead of a guess:
   wizard** (`cli/src/wizard.rs`, plain stdin prompts, not a TUI screen):
   find the `.step` file (or ask, if more than one), ask which of the
   global catalog's materials this project uses, save. Bracket-tag rules
-  are deliberately *not* asked about here -- bulk-edit is where those get
+  are deliberately _not_ asked about here -- bulk-edit is where those get
   authored, against real parts, not guessed at during setup.
 
 **Implemented.**
@@ -229,7 +229,7 @@ catalog by name at each use site. **Implemented.**
 One cross-reference remained after this pass: `stock.yaml` itself split
 a material's identity across two top-level lists (`materials`, `sheets`),
 glued back together by a `sheets[].material` name -- the one case that
-*was* already hard-validated (`stock::parse` errors on a miss), but still
+_was_ already hard-validated (`stock::parse` errors on a miss), but still
 paid for "a material can be sold in more than one sheet size" by
 duplicating its name across two lists for no reason. **Resolved:**
 `sheets` nests under its owning `materials[]` entry instead of
@@ -289,9 +289,4 @@ deferred per that section's own "resolved: deferred" -- it's now
 possible to try a real full-project export against bracket-tag rules,
 bulk-edit, section-grouped PDF output, and the unified `storystick.yaml`
 project file all together, which is the trigger tree-scaling's own
-section named for revisiting it. This document exists so this design
-survives a context reset; update it if a decision changes, and split a
-settled, load-bearing decision out into its own file once one exists
-(this repo's ADR convention, in `docs/decisions/`, applies to those) --
-the unified project file and its exception/rule precedence model in
-particular are probably due for one.
+section named for revisiting it.
