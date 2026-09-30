@@ -101,6 +101,14 @@ pub(crate) enum RawAxis {
 /// no further second-guessing -- seeing a wrong three-way guess and
 /// deciding to trust a *different* automatic guess in its place would
 /// defeat the point of a manual override.
+///
+/// Corrected by swapping two roles at a time (`swap_length_width` and
+/// friends), not by cycling through all six permutations looking for the
+/// right one -- a real mislabeling is always "these two got swapped,"
+/// never a three-way rotation, so there's never a wrong candidate worth
+/// stepping past on the way to the fix. Three cups on a table: pick the
+/// two that are wrong and swap them, directly. The rare case that
+/// genuinely needs a rotation is just two swaps in a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct DimensionAssignment {
     pub(crate) length_from: RawAxis,
@@ -115,49 +123,39 @@ impl DimensionAssignment {
         thickness_from: RawAxis::Thickness,
     };
 
-    /// Every way to assign the three raw values to the three roles, in a
-    /// fixed cycle starting from `AS_GUESSED` -- what `next` steps
-    /// through one keypress at a time, so correcting a mislabeled part is
-    /// a matter of stepping past each candidate until the displayed
-    /// numbers look right, never editing a number directly.
-    const ALL: [DimensionAssignment; 6] = [
-        Self::AS_GUESSED,
-        Self {
-            length_from: RawAxis::Width,
-            width_from: RawAxis::Length,
-            thickness_from: RawAxis::Thickness,
-        },
-        Self {
-            length_from: RawAxis::Thickness,
-            width_from: RawAxis::Width,
-            thickness_from: RawAxis::Length,
-        },
-        Self {
-            length_from: RawAxis::Length,
-            width_from: RawAxis::Thickness,
-            thickness_from: RawAxis::Width,
-        },
-        Self {
-            length_from: RawAxis::Thickness,
-            width_from: RawAxis::Length,
-            thickness_from: RawAxis::Width,
-        },
-        Self {
-            length_from: RawAxis::Width,
-            width_from: RawAxis::Thickness,
-            thickness_from: RawAxis::Length,
-        },
-    ];
-
     pub(crate) fn is_as_guessed(&self) -> bool {
         *self == Self::AS_GUESSED
     }
 
-    /// The next assignment in `ALL`'s cycle, wrapping back to
-    /// `AS_GUESSED` after the last one.
-    pub(crate) fn next(&self) -> Self {
-        let i = Self::ALL.iter().position(|a| a == self).unwrap_or(0);
-        Self::ALL[(i + 1) % Self::ALL.len()]
+    /// Swaps which raw value fills the length and width roles, leaving
+    /// thickness alone. An involution: applying it twice returns to the
+    /// assignment it started from.
+    pub(crate) fn swap_length_width(&self) -> Self {
+        Self {
+            length_from: self.width_from,
+            width_from: self.length_from,
+            thickness_from: self.thickness_from,
+        }
+    }
+
+    /// Swaps which raw value fills the length and thickness roles,
+    /// leaving width alone. See `swap_length_width`.
+    pub(crate) fn swap_length_thickness(&self) -> Self {
+        Self {
+            length_from: self.thickness_from,
+            width_from: self.width_from,
+            thickness_from: self.length_from,
+        }
+    }
+
+    /// Swaps which raw value fills the width and thickness roles,
+    /// leaving length alone. See `swap_length_width`.
+    pub(crate) fn swap_width_thickness(&self) -> Self {
+        Self {
+            length_from: self.length_from,
+            width_from: self.thickness_from,
+            thickness_from: self.width_from,
+        }
     }
 
     fn pick(axis: RawAxis, raw: (f64, f64, f64)) -> f64 {
@@ -221,7 +219,7 @@ mod tests {
         let over = PartOverride {
             material: None,
             grain_along_length: true,
-            dimensions: DimensionAssignment::AS_GUESSED.next(),
+            dimensions: DimensionAssignment::AS_GUESSED.swap_length_width(),
         };
         let yaml = yaml_serde::to_string(&over).unwrap();
         assert_eq!(
@@ -242,27 +240,63 @@ mod tests {
         let with_all = PartOverride {
             material: Some("Sande Ply 3/4".to_string()),
             grain_along_length: false,
-            dimensions: DimensionAssignment::AS_GUESSED.next(),
+            dimensions: DimensionAssignment::AS_GUESSED.swap_length_width(),
         };
         let yaml = yaml_serde::to_string(&with_all).unwrap();
         let back: PartOverride = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(back.material.as_deref(), Some("Sande Ply 3/4"));
         assert!(!back.grain_along_length);
-        assert_eq!(back.dimensions, DimensionAssignment::AS_GUESSED.next());
+        assert_eq!(
+            back.dimensions,
+            DimensionAssignment::AS_GUESSED.swap_length_width()
+        );
     }
 
     #[test]
-    fn dimension_assignment_cycle_visits_every_permutation_once_and_returns_to_as_guessed() {
-        let mut seen = std::collections::HashSet::new();
-        let mut current = DimensionAssignment::AS_GUESSED;
-        for _ in 0..6 {
-            assert!(seen.insert(current), "cycle repeated {current:?} early");
-            current = current.next();
-        }
+    fn each_swap_is_its_own_inverse() {
+        let start = DimensionAssignment::AS_GUESSED;
+        assert_eq!(start.swap_length_width().swap_length_width(), start);
+        assert_eq!(start.swap_length_thickness().swap_length_thickness(), start);
+        assert_eq!(start.swap_width_thickness().swap_width_thickness(), start);
+    }
+
+    #[test]
+    fn swaps_leave_the_untouched_role_alone() {
+        let start = DimensionAssignment::AS_GUESSED;
         assert_eq!(
-            current,
-            DimensionAssignment::AS_GUESSED,
-            "cycle must return to AS_GUESSED after all 6 permutations"
+            start.swap_length_width().thickness_from,
+            start.thickness_from
+        );
+        assert_eq!(start.swap_length_thickness().width_from, start.width_from);
+        assert_eq!(start.swap_width_thickness().length_from, start.length_from);
+    }
+
+    #[test]
+    fn two_different_swaps_in_a_row_reach_a_rotation_no_single_swap_can() {
+        // A genuine three-way rotation (each role pulling from a
+        // different raw value than any single swap would produce) is
+        // reachable by composing two swaps, even though there's no direct
+        // action for it -- confirming that composing swaps still covers
+        // the full permutation space, not just the three pairwise cases.
+        let rotated = DimensionAssignment::AS_GUESSED
+            .swap_length_width()
+            .swap_width_thickness();
+        assert_eq!(
+            rotated,
+            DimensionAssignment {
+                length_from: RawAxis::Width,
+                width_from: RawAxis::Thickness,
+                thickness_from: RawAxis::Length,
+            }
+        );
+        assert_ne!(rotated, DimensionAssignment::AS_GUESSED.swap_length_width());
+        assert_ne!(
+            rotated,
+            DimensionAssignment::AS_GUESSED.swap_length_thickness()
+        );
+        assert_ne!(
+            rotated,
+            DimensionAssignment::AS_GUESSED.swap_width_thickness()
         );
     }
 

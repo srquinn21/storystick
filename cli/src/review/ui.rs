@@ -47,6 +47,10 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Tab / j / k", "switch Material / Grain / Dimensions"),
             ("Enter", "edit the focused field"),
+            (
+                "1 / 2 / 3",
+                "on Dimensions: swap L/W, L/T, or W/T (Enter = L/W)",
+            ),
         ],
     ),
     (
@@ -73,6 +77,7 @@ const PICKER_HELP: &[(&str, &str)] = &[("j/k", "move"), ("Enter", "confirm"), ("
 const PART_EDIT_HELP: &[(&str, &str)] = &[
     ("Tab/j/k", "switch field"),
     ("Enter", "edit field"),
+    ("1/2/3", "on Dimensions: swap L/W, L/T, W/T"),
     ("Esc", "done"),
 ];
 
@@ -400,27 +405,16 @@ fn draw_bulk(frame: &mut Frame, area: Rect, app: &mut App) {
 
 /// A single part's Material + Grain + Dimensions fields on one screen
 /// (`App::part_edit`) -- Tab/`j`/`k` cycles which field is focused,
-/// `Enter` acts on it (opens the material picker, toggles grain, or steps
-/// to the next dimension assignment). Drawn before `draw_picker` in
-/// `draw` so a Material-triggered picker renders on top of this.
+/// `Enter` acts on it (opens the material picker, toggles grain, or swaps
+/// length/width -- the commonest dimension fix). While Dimensions has
+/// focus, its line also shows `1`/`2`/`3`, the other two pairwise swaps
+/// (see `App::swap_length_width` and friends). Drawn before `draw_picker`
+/// in `draw` so a Material-triggered picker renders on top of this.
 fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
     let Some(pe) = &app.part_edit else {
         return;
     };
     let part = &app.parts[pe.part_index];
-    let popup = centered_rect(60, 8, area);
-
-    let field_line = |label: &str, value: &str, focused: bool| {
-        let text = format!(" {label:<12}{value}");
-        if focused {
-            Line::styled(
-                text,
-                Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Line::from(text)
-        }
-    };
 
     let material = part
         .material
@@ -432,24 +426,53 @@ fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "along width"
     };
-    let dimensions = format!(
-        "L {:.4}  W {:.4}  T {:.4}",
-        part.length_in, part.width_in, part.thickness_in
+    let dimensions_focused = pe.focus == PartEditField::Dimensions;
+    let dimensions = if dimensions_focused {
+        format!(
+            "L {:.4}  W {:.4}  T {:.4}   [1] L/W  [2] L/T  [3] W/T",
+            part.length_in, part.width_in, part.thickness_in
+        )
+    } else {
+        format!(
+            "L {:.4}  W {:.4}  T {:.4}",
+            part.length_in, part.width_in, part.thickness_in
+        )
+    };
+
+    let field_text = |label: &str, value: &str| format!(" {label:<12}{value}");
+    let material_text = field_text("Material:", material);
+    let grain_text = field_text("Grain:", grain);
+    let dimensions_text = field_text("Dimensions:", &dimensions);
+    let title = format!(" {} ", part.path);
+
+    let width = popup_width(
+        60,
+        [&material_text, &grain_text, &dimensions_text]
+            .iter()
+            .map(|s| s.chars().count())
+            .chain(std::iter::once(title.chars().count())),
     );
+    let popup = centered_rect(width, 8, area);
+
+    let styled = |text: String, focused: bool| {
+        if focused {
+            Line::styled(
+                text,
+                Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Line::from(text)
+        }
+    };
 
     let lines = vec![
-        field_line("Material:", material, pe.focus == PartEditField::Material),
+        styled(material_text, pe.focus == PartEditField::Material),
         Line::from(""),
-        field_line("Grain:", grain, pe.focus == PartEditField::Grain),
+        styled(grain_text, pe.focus == PartEditField::Grain),
         Line::from(""),
-        field_line(
-            "Dimensions:",
-            &dimensions,
-            pe.focus == PartEditField::Dimensions,
-        ),
+        styled(dimensions_text, dimensions_focused),
     ];
 
-    let title = format!(" {} ", part.path);
     let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(lines).block(block);
 

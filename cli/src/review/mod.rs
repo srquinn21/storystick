@@ -38,6 +38,14 @@
 //! (the narrow-rip case), but treats any other assignment as a settled
 //! human decision, not something to second-guess further.
 //!
+//! A mislabeling is corrected by swapping two roles at a time (the edit
+//! modal's Dimensions field shows all three raw values with a dedicated
+//! key next to each pair -- `1` for length/width, `2` for length/
+//! thickness, `3` for width/thickness), never by cycling through
+//! candidates: a real mislabeling is always "these two got swapped,"
+//! never a three-way rotation, so there's no wrong candidate worth
+//! stepping past on the way to the fix -- see `DimensionAssignment`.
+//!
 //! Grain direction is a separate decision again -- which of a part's
 //! (now correctly labeled) length/width dimensions the grain actually
 //! runs along -- tracked as its own field (`Part::grain_along_length`,
@@ -980,8 +988,10 @@ impl App {
     /// existing material picker (`open_picker`, which already resolves
     /// the target part from `selected_part_index`, still pointing at the
     /// right part while this modal has focus), Grain flips the grain axis
-    /// directly (`toggle_grain`), and Dimensions steps to the next
-    /// dimension assignment directly (`cycle_dimensions`).
+    /// directly (`toggle_grain`), and Dimensions performs the same fix
+    /// `Enter` always performs on it: swap length and width, by far the
+    /// commonest mislabeling. The other two swaps (`2`/`3`) have no
+    /// `Enter` equivalent -- see `run`'s dispatch and `swap_length_width`.
     fn confirm_part_edit_field(&mut self) {
         let Some(pe) = &self.part_edit else {
             return;
@@ -989,7 +999,7 @@ impl App {
         match pe.focus {
             PartEditField::Material => self.open_picker(),
             PartEditField::Grain => self.toggle_grain(),
-            PartEditField::Dimensions => self.cycle_dimensions(),
+            PartEditField::Dimensions => self.swap_length_width(),
         }
     }
 
@@ -1176,25 +1186,46 @@ impl App {
         ));
     }
 
-    /// Steps this part's `dimensions` to the next candidate in
-    /// `DimensionAssignment`'s fixed cycle and recomputes
-    /// `length_in`/`width_in`/`thickness_in` from the result -- unlike
-    /// grain, a dimension reassignment genuinely changes what those three
-    /// numbers are, so (unlike `toggle_grain`) this does call
-    /// `resolve_part_dims`.
-    fn cycle_dimensions(&mut self) {
+    /// Applies one of `DimensionAssignment`'s pairwise swaps to the
+    /// selected part and recomputes `length_in`/`width_in`/`thickness_in`
+    /// from the result -- unlike grain, a dimension reassignment
+    /// genuinely changes what those three numbers are, so (unlike
+    /// `toggle_grain`) this does call `resolve_part_dims`. Shared by
+    /// `swap_length_width`/`swap_length_thickness`/`swap_width_thickness`,
+    /// which differ only in which of `DimensionAssignment`'s three swap
+    /// methods and status label they pass.
+    fn swap_dimensions(
+        &mut self,
+        swap: fn(&DimensionAssignment) -> DimensionAssignment,
+        label: &str,
+    ) {
         let Some(i) = self.selected_part_index() else {
             self.set_status("select a part first");
             return;
         };
-        self.parts[i].dimensions = self.parts[i].dimensions.next();
+        self.parts[i].dimensions = swap(&self.parts[i].dimensions);
         self.resolve_part_dims(i);
         self.dirty = true;
         let p = &self.parts[i];
         self.set_status(format!(
-            "dimensions: length {:.4}, width {:.4}, thickness {:.4} for {}",
+            "swapped {label} -- length {:.4}, width {:.4}, thickness {:.4} for {}",
             p.length_in, p.width_in, p.thickness_in, p.path
         ));
+    }
+
+    fn swap_length_width(&mut self) {
+        self.swap_dimensions(DimensionAssignment::swap_length_width, "length/width");
+    }
+
+    fn swap_length_thickness(&mut self) {
+        self.swap_dimensions(
+            DimensionAssignment::swap_length_thickness,
+            "length/thickness",
+        );
+    }
+
+    fn swap_width_thickness(&mut self) {
+        self.swap_dimensions(DimensionAssignment::swap_width_thickness, "width/thickness");
     }
 
     fn save(&mut self) {
@@ -1622,7 +1653,8 @@ pub(crate) fn run(
                 continue;
             }
 
-            if app.part_edit.is_some() {
+            if let Some(pe) = &app.part_edit {
+                let dimensions_focused = pe.focus == PartEditField::Dimensions;
                 match key.code {
                     KeyCode::Esc => app.part_edit = None,
                     KeyCode::Tab
@@ -1631,6 +1663,11 @@ pub(crate) fn run(
                     | KeyCode::Char('j')
                     | KeyCode::Char('k') => app.part_edit_toggle_focus(),
                     KeyCode::Enter => app.confirm_part_edit_field(),
+                    // Direct pairwise swaps, only while Dimensions has
+                    // focus -- see `swap_length_width` and friends.
+                    KeyCode::Char('1') if dimensions_focused => app.swap_length_width(),
+                    KeyCode::Char('2') if dimensions_focused => app.swap_length_thickness(),
+                    KeyCode::Char('3') if dimensions_focused => app.swap_width_thickness(),
                     _ => {}
                 }
                 continue;
@@ -1778,7 +1815,6 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assignments::RawAxis;
     use std::collections::BTreeMap;
 
     fn material(name: &str, thickness_in: f64) -> Material {
@@ -1942,11 +1978,7 @@ mod tests {
             name: "Baltic Birch 3/4".to_string(),
             thickness_mm: 0.75 * MM_PER_IN,
         };
-        let swap_length_width = DimensionAssignment {
-            length_from: RawAxis::Width,
-            width_from: RawAxis::Length,
-            thickness_from: RawAxis::Thickness,
-        };
+        let swap_length_width = DimensionAssignment::AS_GUESSED.swap_length_width();
         let (length_in, width_in, thickness_in, mismatch) =
             resolve_dims((24.0, 0.75, 0.25), Some(&bb34), swap_length_width);
         assert_eq!((length_in, width_in, thickness_in), (0.75, 24.0, 0.25));
