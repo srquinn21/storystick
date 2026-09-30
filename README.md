@@ -19,7 +19,30 @@ Or run it straight from the workspace without installing:
 cargo run --release -p storystick
 ```
 
+### Working on storystick itself
+
+Run this once after cloning:
+
+```
+./scripts/dev.sh
+```
+
+It builds `storystick` and symlinks the binary onto your `PATH`, and
+seeds a starter stock catalog (see below) if you don't already have one.
+Because it's a symlink rather than a copy, a plain
+
+```
+cargo build --manifest-path cli/Cargo.toml
+```
+
+is all you need after that to pick up further edits -- no reinstalling,
+no `--force`.
+
 ## Set up your stock catalog (once)
+
+`scripts/dev.sh` does this step for you automatically (skipping it if the
+file already exists) -- read on if you're setting it up by hand, or want
+to know the format.
 
 storystick looks for your stock catalog at `~/.config/storystick/stock.yaml`
 by default (override per run with `--stock <path>`). This is the one
@@ -89,9 +112,10 @@ A part's own Shapr3D name often carries a bracket tag (`[Panel]`,
 3. **Unassigned** -- flagged, needing your attention.
 
 Bulk-edit (`b`) is how a rule gets authored, almost always -- pick a
-tag, see how many parts carry it and what they're currently set to, then
-apply one material to all of them at once. That choice is saved as the
-tag's *rule*, not stamped onto each of today's parts individually: a
+bracket tag from a list (each row showing its part count and current rule
+material, if any), then pick a material to apply to all of them at once.
+That choice is saved as the tag's *rule*, not stamped onto each of today's
+parts individually: a
 `[Panel]` part added in next week's re-export of the same model picks up
 the existing `[Panel]` rule automatically, with nothing more to do. The
 single-part picker (`m`) instead carves out an exception for just the
@@ -118,8 +142,8 @@ Keys:
 - `Enter` -- expand/collapse a folder, or open the material picker on a part
 - `m` -- open the material picker on the selected part directly (sets an
   exception for just this part)
-- `b` -- bulk-edit: pick a bracket tag, see a summary of how many parts
-  carry it and what they're currently set to, then set (or clear) that
+- `b` -- bulk-edit: pick a bracket tag from a list (showing its part
+  count and current rule material, if any), then set or clear that
   tag's rule for every part carrying it
 - `g` -- swap the selected part's length and width
 - `Ctrl-d` / `Ctrl-u` -- half-page down/up
