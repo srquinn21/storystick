@@ -248,6 +248,7 @@ pub(crate) fn discover(start: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assignments::DimensionAssignment;
     use std::collections::HashSet;
 
     fn material(name: &str, thickness_mm: f64) -> Material {
@@ -414,6 +415,7 @@ assignments:
             PartOverride {
                 material: Some("Sande Ply 3/4".to_string()),
                 grain_along_length: true,
+                dimensions: DimensionAssignment::AS_GUESSED,
             },
         );
         let project = Project {
@@ -466,6 +468,7 @@ assignments:
             PartOverride {
                 material: Some("Oak".to_string()),
                 grain_along_length: true,
+                dimensions: DimensionAssignment::AS_GUESSED,
             },
         );
         let project = Project {

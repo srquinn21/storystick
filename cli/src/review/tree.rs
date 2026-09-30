@@ -384,6 +384,7 @@ mod tests {
             material: None,
             is_exception: false,
             grain_along_length: true,
+            dimensions: crate::assignments::DimensionAssignment::AS_GUESSED,
         }
     }
 

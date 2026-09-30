@@ -25,21 +25,30 @@
 //! does) -- there's no third "explicitly no material" state to hold in
 //! reserve, on either the exception or the rule side.
 //!
-//! A part's length/width labels are never user-editable: stepcrawl's own
-//! guess (longer of the two in-plane dimensions is length, corrected
-//! against a known material thickness by `resolve_dims`) is a plain
-//! geometric fact, not a decision to record. Grain direction *is* a
-//! decision -- which of those two dimensions the grain actually runs
-//! along -- and it's tracked as its own field (`Part::grain_along_length`,
-//! the edit modal's Grain field), independent of which one is labeled
-//! length. Defaulting to "along length" covers the common case, but a
-//! piece is sometimes designed with the grain running the other way on
-//! purpose, and that's not the same fact as which edge happens to be
-//! longer. `Part::to_packable` is the one place the two facts meet: it
-//! picks whichever raw dimension the grain runs along and hands *that*
-//! to `PackablePart` as `length_mm`, per that module's own "length_mm
-//! always runs with the grain" convention -- the packer never learns
-//! which edge this project calls "length" for display.
+//! A part's raw dimension *numbers* are never editable -- Shapr3D's
+//! export is the source of truth -- but which of the three raw measured
+//! values (`raw_length_in`/`raw_width_in`/`raw_thickness_in`, always
+//! stepcrawl's largest/middle/smallest guess) fills which of the
+//! length/width/thickness *roles* is exactly that: a guess, and one
+//! that's sometimes simply wrong (e.g. the thin edge by design isn't the
+//! smallest number). `Part::dimensions` (`DimensionAssignment`, the edit
+//! modal's Dimensions field) is the explicit correction for that case --
+//! see `resolve_dims`, which is still free to auto-correct the default
+//! `DimensionAssignment::AS_GUESSED` against a known material's thickness
+//! (the narrow-rip case), but treats any other assignment as a settled
+//! human decision, not something to second-guess further.
+//!
+//! Grain direction is a separate decision again -- which of a part's
+//! (now correctly labeled) length/width dimensions the grain actually
+//! runs along -- tracked as its own field (`Part::grain_along_length`,
+//! the edit modal's Grain field). Defaulting to "along length" covers the
+//! common case, but a piece is sometimes designed with the grain running
+//! the other way on purpose, and that's not the same fact as which edge
+//! is labeled length. `Part::to_packable` is the one place grain meets
+//! packing: it picks whichever labeled dimension the grain runs along and
+//! hands *that* to `PackablePart` as `length_mm`, per that module's own
+//! "length_mm always runs with the grain" convention -- the packer never
+//! learns which edge this project calls "length" for display.
 //!
 //! Keys split into pure movement (bare keys: `hjkl`, `gg`/`G`, `/`, `]f`/
 //! `[f`, `n`/`N`) and commands, which live behind a leader key (bare
@@ -53,7 +62,7 @@
 mod tree;
 mod ui;
 
-use crate::assignments::PartOverride;
+use crate::assignments::{DimensionAssignment, PartOverride};
 use crate::project::Project;
 use crate::{autofill, round4, stock, MM_PER_IN};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -120,10 +129,11 @@ pub(crate) struct Part {
     /// length, shorter is width, third is thickness) -- immutable for the
     /// part's lifetime, since it's the actual geometric measurement.
     /// `length_in`/`width_in`/`thickness_in` are derived from this (see
-    /// `resolve_dims`), recomputed whenever `material` changes. Keeping
-    /// the raw triple fixed is what makes that derivation reversible:
-    /// re-picking a different material recovers the exact original
-    /// numbers instead of drifting through repeated corrections.
+    /// `resolve_dims`), recomputed whenever `material` or `dimensions`
+    /// changes. Keeping the raw triple fixed is what makes that
+    /// derivation reversible: re-picking a different material, or
+    /// cycling `dimensions` back to `AS_GUESSED`, recovers the exact
+    /// original numbers instead of drifting through repeated corrections.
     /// `grain_along_length` is unrelated to this derivation -- it never
     /// changes which raw dimension is which, only which one packing
     /// treats as running with the grain.
@@ -161,10 +171,17 @@ pub(crate) struct Part {
     pub is_exception: bool,
     /// Which of `length_in`/`width_in` the grain runs along -- `true`
     /// (the default) for length, `false` when this piece is designed with
-    /// the grain running along its width instead. Independent of the
-    /// length/width labels themselves, which are never user-editable (see
-    /// this module's docs).
+    /// the grain running along its width instead. Independent of
+    /// `dimensions`, which decides what those labels *mean* in the first
+    /// place, not which one the grain follows.
     pub grain_along_length: bool,
+    /// Manual correction of which raw measured value fills which of
+    /// length/width/thickness -- see `DimensionAssignment`. Stays at
+    /// `AS_GUESSED` for the overwhelming majority of parts, where
+    /// stepcrawl's own largest/middle/smallest guess (corrected against a
+    /// known material's thickness by `resolve_dims`) already gets it
+    /// right.
+    pub dimensions: DimensionAssignment,
 }
 
 fn assignment_key(path: &str, length_in: f64, width_in: f64, thickness_in: f64) -> String {
@@ -172,15 +189,36 @@ fn assignment_key(path: &str, length_in: f64, width_in: f64, thickness_in: f64) 
 }
 
 /// Derives (length_in, width_in, thickness_in, thickness_mismatch) from a
-/// part's raw (length_in, width_in, thickness_in) guess and a possibly-
-/// assigned material. Operates purely on the *values* in `raw`, never
-/// their current field positions, so it's safe to call repeatedly as
-/// material state changes: re-deriving from the same three raw numbers
-/// each time means a cleared material recovers exactly the original
-/// guess, and a changed material re-picks thickness fresh rather than
-/// compounding onto a previous correction. Grain direction plays no part
-/// here -- see `Part::grain_along_length`.
-fn resolve_dims(raw: (f64, f64, f64), material: Option<&Material>) -> (f64, f64, f64, bool) {
+/// part's raw (length_in, width_in, thickness_in) guess, a possibly-
+/// assigned material, and a `DimensionAssignment`. Operates purely on the
+/// *values* in `raw`, never their current field positions, so it's safe
+/// to call repeatedly as material or assignment state changes: re-deriving
+/// from the same three raw numbers each time means a cleared material, or
+/// an assignment cycled back to `AS_GUESSED`, recovers exactly the
+/// original guess rather than drifting through repeated corrections.
+/// Grain direction plays no part here -- see `Part::grain_along_length`.
+///
+/// While `assignment` is still `DimensionAssignment::AS_GUESSED`, a known
+/// material is free to auto-correct which raw value is really the
+/// thickness (the narrow-rip case). Any other assignment is an explicit
+/// human decision instead: it's applied exactly as given, with no further
+/// automatic relabeling -- only `thickness_mismatch` still gets
+/// recomputed against it, so a manual assignment that doesn't actually
+/// fit the assigned material still surfaces as a real problem rather than
+/// being silently trusted.
+fn resolve_dims(
+    raw: (f64, f64, f64),
+    material: Option<&Material>,
+    assignment: DimensionAssignment,
+) -> (f64, f64, f64, bool) {
+    if !assignment.is_as_guessed() {
+        let (length_in, width_in, thickness_in) = assignment.apply(raw);
+        let thickness_mismatch = material.is_some_and(|m| {
+            (thickness_in * MM_PER_IN - m.thickness_mm).abs()
+                > COMPATIBLE_THICKNESS_TOLERANCE_IN * MM_PER_IN
+        });
+        return (length_in, width_in, thickness_in, thickness_mismatch);
+    }
     let (mut length_in, mut width_in, mut thickness_in) = raw;
     let mut thickness_mismatch = false;
     if let Some(m) = material {
@@ -426,10 +464,12 @@ fn load_parts(
             let (material_name, is_exception) =
                 resolve_material(&instance.path, exception, &project.autofill);
             let grain_along_length = over.map(|o| o.grain_along_length).unwrap_or(true);
+            let dimensions = over.map(|o| o.dimensions).unwrap_or_default();
             let material = material_name.map(|name| find_material(materials, &name).clone());
             let (length_in, width_in, thickness_in, thickness_mismatch) = resolve_dims(
                 (raw_length_in, raw_width_in, raw_thickness_in),
                 material.as_ref(),
+                dimensions,
             );
             parts.push(Part {
                 path: instance.path.clone(),
@@ -445,6 +485,7 @@ fn load_parts(
                 material,
                 is_exception,
                 grain_along_length,
+                dimensions,
             });
         }
     }
@@ -570,16 +611,19 @@ pub(crate) struct PrintSettings {
     trim_touched: bool,
 }
 
-/// A part's two editable fields -- material and grain -- edited together
-/// on one screen (`PartEditState`) rather than as separate top-level
-/// commands. These are, deliberately, the *only* two: geometry is never
-/// editable in storystick (Shapr3D is the source of truth), and the only
-/// other per-part flag (`Part::unreliable`) is a read-only import-time
-/// diagnostic, not a decision to record here.
+/// A part's three editable fields -- material, grain, and dimension
+/// labeling -- edited together on one screen (`PartEditState`) rather
+/// than as separate top-level commands. These are, deliberately, the
+/// *only* three: the raw measured *numbers* are never editable in
+/// storystick (Shapr3D is the source of truth) -- Dimensions only
+/// reassigns which role each one plays, never their values -- and the
+/// only other per-part flag (`Part::unreliable`) is a read-only
+/// import-time diagnostic, not a decision to record here.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PartEditField {
     Material,
     Grain,
+    Dimensions,
 }
 
 pub(crate) struct PartEditState {
@@ -927,15 +971,17 @@ impl App {
         };
         pe.focus = match pe.focus {
             PartEditField::Material => PartEditField::Grain,
-            PartEditField::Grain => PartEditField::Material,
+            PartEditField::Grain => PartEditField::Dimensions,
+            PartEditField::Dimensions => PartEditField::Material,
         };
     }
 
     /// Acts on the part-edit modal's focused field -- Material opens the
     /// existing material picker (`open_picker`, which already resolves
     /// the target part from `selected_part_index`, still pointing at the
-    /// right part while this modal has focus) and Grain flips the grain
-    /// axis directly (`toggle_grain`).
+    /// right part while this modal has focus), Grain flips the grain axis
+    /// directly (`toggle_grain`), and Dimensions steps to the next
+    /// dimension assignment directly (`cycle_dimensions`).
     fn confirm_part_edit_field(&mut self) {
         let Some(pe) = &self.part_edit else {
             return;
@@ -943,6 +989,7 @@ impl App {
         match pe.focus {
             PartEditField::Material => self.open_picker(),
             PartEditField::Grain => self.toggle_grain(),
+            PartEditField::Dimensions => self.cycle_dimensions(),
         }
     }
 
@@ -1023,10 +1070,10 @@ impl App {
     }
 
     /// Recomputes `length_in`/`width_in`/`thickness_in`/`thickness_mismatch`
-    /// for `self.parts[i]` from its raw dims and current material -- call
-    /// after mutating the material (see `resolve_dims`). Grain direction
-    /// never needs this: `grain_along_length` doesn't participate in the
-    /// derivation.
+    /// for `self.parts[i]` from its raw dims, current material, and
+    /// current dimension assignment -- call after mutating any of the
+    /// three (see `resolve_dims`). Grain direction never needs this:
+    /// `grain_along_length` doesn't participate in the derivation.
     fn resolve_part_dims(&mut self, i: usize) {
         let material = self.parts[i].material.clone();
         let raw = (
@@ -1034,8 +1081,9 @@ impl App {
             self.parts[i].raw_width_in,
             self.parts[i].raw_thickness_in,
         );
+        let dimensions = self.parts[i].dimensions;
         let (length_in, width_in, thickness_in, thickness_mismatch) =
-            resolve_dims(raw, material.as_ref());
+            resolve_dims(raw, material.as_ref(), dimensions);
         let part = &mut self.parts[i];
         part.length_in = length_in;
         part.width_in = width_in;
@@ -1128,6 +1176,27 @@ impl App {
         ));
     }
 
+    /// Steps this part's `dimensions` to the next candidate in
+    /// `DimensionAssignment`'s fixed cycle and recomputes
+    /// `length_in`/`width_in`/`thickness_in` from the result -- unlike
+    /// grain, a dimension reassignment genuinely changes what those three
+    /// numbers are, so (unlike `toggle_grain`) this does call
+    /// `resolve_part_dims`.
+    fn cycle_dimensions(&mut self) {
+        let Some(i) = self.selected_part_index() else {
+            self.set_status("select a part first");
+            return;
+        };
+        self.parts[i].dimensions = self.parts[i].dimensions.next();
+        self.resolve_part_dims(i);
+        self.dirty = true;
+        let p = &self.parts[i];
+        self.set_status(format!(
+            "dimensions: length {:.4}, width {:.4}, thickness {:.4} for {}",
+            p.length_in, p.width_in, p.thickness_in, p.path
+        ));
+    }
+
     fn save(&mut self) {
         self.project.assignments = self
             .parts
@@ -1144,6 +1213,7 @@ impl App {
                 let over = PartOverride {
                     material,
                     grain_along_length: p.grain_along_length,
+                    dimensions: p.dimensions,
                 };
                 if over.is_empty() {
                     None
@@ -1708,6 +1778,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assignments::RawAxis;
     use std::collections::BTreeMap;
 
     fn material(name: &str, thickness_in: f64) -> Material {
@@ -1735,6 +1806,7 @@ mod tests {
             }),
             is_exception: material.is_some(),
             grain_along_length: true,
+            dimensions: DimensionAssignment::AS_GUESSED,
         }
     }
 
@@ -1814,7 +1886,8 @@ mod tests {
 
     #[test]
     fn resolve_dims_leaves_the_raw_guess_alone_with_no_material() {
-        let (length_in, width_in, thickness_in, mismatch) = resolve_dims((30.0, 20.0, 0.75), None);
+        let (length_in, width_in, thickness_in, mismatch) =
+            resolve_dims((30.0, 20.0, 0.75), None, DimensionAssignment::AS_GUESSED);
         assert_eq!((length_in, width_in, thickness_in), (30.0, 20.0, 0.75));
         assert!(!mismatch);
     }
@@ -1829,8 +1902,11 @@ mod tests {
             name: "Baltic Birch 3/4".to_string(),
             thickness_mm: 0.75 * MM_PER_IN,
         };
-        let (length_in, width_in, thickness_in, mismatch) =
-            resolve_dims((24.0, 0.75, 0.25), Some(&bb34));
+        let (length_in, width_in, thickness_in, mismatch) = resolve_dims(
+            (24.0, 0.75, 0.25),
+            Some(&bb34),
+            DimensionAssignment::AS_GUESSED,
+        );
         assert_eq!((length_in, width_in, thickness_in), (24.0, 0.25, 0.75));
         assert!(!mismatch);
     }
@@ -1841,12 +1917,44 @@ mod tests {
             name: "1/8\" hardboard".to_string(),
             thickness_mm: 0.125 * MM_PER_IN,
         };
-        let (length_in, width_in, thickness_in, mismatch) =
-            resolve_dims((30.0, 20.0, 0.75), Some(&unrelated));
+        let (length_in, width_in, thickness_in, mismatch) = resolve_dims(
+            (30.0, 20.0, 0.75),
+            Some(&unrelated),
+            DimensionAssignment::AS_GUESSED,
+        );
         // No dimension is anywhere near 0.125" -- dims fall back to the
         // raw guess rather than silently picking the closest anyway.
         assert_eq!((length_in, width_in, thickness_in), (30.0, 20.0, 0.75));
         assert!(mismatch);
+    }
+
+    #[test]
+    fn resolve_dims_applies_a_manual_assignment_without_further_auto_correction() {
+        // Same raw triple and material as the narrow-rip test above,
+        // where AS_GUESSED's auto-correction finds thickness=0.75 and
+        // fixes the split. Here the user instead swaps length/width
+        // manually and leaves the raw (wrong) thickness alone: the result
+        // must be exactly that swap, not the auto-corrected split, and
+        // the resulting thickness_mismatch must reflect *this* thickness
+        // against the material, not the one auto-correction would have
+        // picked.
+        let bb34 = Material {
+            name: "Baltic Birch 3/4".to_string(),
+            thickness_mm: 0.75 * MM_PER_IN,
+        };
+        let swap_length_width = DimensionAssignment {
+            length_from: RawAxis::Width,
+            width_from: RawAxis::Length,
+            thickness_from: RawAxis::Thickness,
+        };
+        let (length_in, width_in, thickness_in, mismatch) =
+            resolve_dims((24.0, 0.75, 0.25), Some(&bb34), swap_length_width);
+        assert_eq!((length_in, width_in, thickness_in), (0.75, 24.0, 0.25));
+        assert!(
+            mismatch,
+            "0.25\" thickness doesn't fit a 0.75\" material -- must flag, not silently \
+             re-guess a fitting split the way AS_GUESSED would"
+        );
     }
 
     #[test]

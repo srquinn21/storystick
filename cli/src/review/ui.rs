@@ -45,7 +45,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Part edit",
         &[
-            ("Tab / j / k", "switch Material / Grain"),
+            ("Tab / j / k", "switch Material / Grain / Dimensions"),
             ("Enter", "edit the focused field"),
         ],
     ),
@@ -398,17 +398,17 @@ fn draw_bulk(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(list, popup, list_state);
 }
 
-/// A single part's Material + Grain fields on one screen (`App::
-/// part_edit`) -- Tab/`j`/`k` cycles which field is focused, `Enter` acts
-/// on it (opens the material picker, or toggles grain directly). Drawn
-/// before `draw_picker` in `draw` so a Material-triggered picker renders
-/// on top of this.
+/// A single part's Material + Grain + Dimensions fields on one screen
+/// (`App::part_edit`) -- Tab/`j`/`k` cycles which field is focused,
+/// `Enter` acts on it (opens the material picker, toggles grain, or steps
+/// to the next dimension assignment). Drawn before `draw_picker` in
+/// `draw` so a Material-triggered picker renders on top of this.
 fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
     let Some(pe) = &app.part_edit else {
         return;
     };
     let part = &app.parts[pe.part_index];
-    let popup = centered_rect(60, 6, area);
+    let popup = centered_rect(60, 8, area);
 
     let field_line = |label: &str, value: &str, focused: bool| {
         let text = format!(" {label:<12}{value}");
@@ -432,11 +432,21 @@ fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "along width"
     };
+    let dimensions = format!(
+        "L {:.4}  W {:.4}  T {:.4}",
+        part.length_in, part.width_in, part.thickness_in
+    );
 
     let lines = vec![
         field_line("Material:", material, pe.focus == PartEditField::Material),
         Line::from(""),
         field_line("Grain:", grain, pe.focus == PartEditField::Grain),
+        Line::from(""),
+        field_line(
+            "Dimensions:",
+            &dimensions,
+            pe.focus == PartEditField::Dimensions,
+        ),
     ];
 
     let title = format!(" {} ", part.path);
