@@ -403,14 +403,30 @@ fn draw_bulk(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(list, popup, list_state);
 }
 
+/// How wide a field's label column is in the part-edit modal (see
+/// `draw_part_edit`) -- both a field's own label/value line and the
+/// Dimensions swap-key hint line (indented to this same width, so it
+/// lines up under the values rather than the label) are built against
+/// this one constant.
+const PART_EDIT_LABEL_WIDTH: usize = 12;
+
 /// A single part's Material + Grain + Dimensions fields on one screen
 /// (`App::part_edit`) -- Tab/`j`/`k` cycles which field is focused,
 /// `Enter` acts on it (opens the material picker, toggles grain, or swaps
-/// length/width -- the commonest dimension fix). While Dimensions has
-/// focus, its line also shows `1`/`2`/`3`, the other two pairwise swaps
-/// (see `App::swap_length_width` and friends). Drawn before `draw_picker`
-/// in `draw` so a Material-triggered picker renders on top of this.
+/// length/width -- the commonest dimension fix). Each row is a colored
+/// label plus a plain value, so the two stay visually distinct whether or
+/// not the row is focused; focus adds a background highlight behind both
+/// rather than changing either color. Dimensions gets a second row below
+/// it, always reserved, showing `1`/`2`/`3` (the other two pairwise
+/// swaps, see `App::swap_length_width` and friends) only while it has
+/// focus -- a fixed row rather than appending to the values line keeps
+/// that line from getting crowded, and reserving it even while blank
+/// keeps the popup from resizing every time focus moves on or off
+/// Dimensions. Drawn before `draw_picker` in `draw` so a
+/// Material-triggered picker renders on top of this.
 fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
+    const DIMENSION_SWAP_HINTS: &[(&str, &str)] = &[("1", "L/W"), ("2", "L/T"), ("3", "W/T")];
+
     let Some(pe) = &app.part_edit else {
         return;
     };
@@ -427,50 +443,73 @@ fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
         "along width"
     };
     let dimensions_focused = pe.focus == PartEditField::Dimensions;
-    let dimensions = if dimensions_focused {
-        format!(
-            "L {:.4}  W {:.4}  T {:.4}   [1] L/W  [2] L/T  [3] W/T",
-            part.length_in, part.width_in, part.thickness_in
-        )
-    } else {
-        format!(
-            "L {:.4}  W {:.4}  T {:.4}",
-            part.length_in, part.width_in, part.thickness_in
-        )
+    let dimensions = format!(
+        "L {:.4}  W {:.4}  T {:.4}",
+        part.length_in, part.width_in, part.thickness_in
+    );
+
+    let field_line = |label: &str, value: &str, focused: bool| {
+        let bg = focused.then_some(Color::Blue);
+        let mut label_style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let mut value_style = Style::new().fg(Color::White);
+        if let Some(bg) = bg {
+            label_style = label_style.bg(bg);
+            value_style = value_style.bg(bg);
+        }
+        Line::from(vec![
+            Span::styled(format!(" {label:<PART_EDIT_LABEL_WIDTH$}"), label_style),
+            Span::styled(value.to_string(), value_style),
+        ])
     };
 
-    let field_text = |label: &str, value: &str| format!(" {label:<12}{value}");
-    let material_text = field_text("Material:", material);
-    let grain_text = field_text("Grain:", grain);
-    let dimensions_text = field_text("Dimensions:", &dimensions);
+    // Same key/action coloring as `help_line`, indented to sit under
+    // Dimensions' values rather than under its label -- this is a
+    // continuation of that row, not a field of its own.
+    let hint_line = || {
+        let mut spans = vec![Span::raw(" ".repeat(1 + PART_EDIT_LABEL_WIDTH))];
+        for (i, (key, action)) in DIMENSION_SWAP_HINTS.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("   "));
+            }
+            spans.push(Span::styled(*key, Style::new().fg(Color::Blue)));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(*action, Style::new().fg(Color::DarkGray)));
+        }
+        Line::from(spans)
+    };
+
+    let plain_field = |label: &str, value: &str| format!(" {label:<PART_EDIT_LABEL_WIDTH$}{value}");
+    let plain_hint = format!(
+        "{}1 L/W   2 L/T   3 W/T",
+        " ".repeat(1 + PART_EDIT_LABEL_WIDTH)
+    );
     let title = format!(" {} ", part.path);
 
     let width = popup_width(
         60,
-        [&material_text, &grain_text, &dimensions_text]
-            .iter()
-            .map(|s| s.chars().count())
-            .chain(std::iter::once(title.chars().count())),
+        [
+            plain_field("Material:", material),
+            plain_field("Grain:", grain),
+            plain_field("Dimensions:", &dimensions),
+            plain_hint,
+        ]
+        .iter()
+        .map(|s| s.chars().count())
+        .chain(std::iter::once(title.chars().count())),
     );
     let popup = centered_rect(width, 8, area);
 
-    let styled = |text: String, focused: bool| {
-        if focused {
-            Line::styled(
-                text,
-                Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Line::from(text)
-        }
-    };
-
     let lines = vec![
-        styled(material_text, pe.focus == PartEditField::Material),
+        field_line("Material:", material, pe.focus == PartEditField::Material),
         Line::from(""),
-        styled(grain_text, pe.focus == PartEditField::Grain),
+        field_line("Grain:", grain, pe.focus == PartEditField::Grain),
         Line::from(""),
-        styled(dimensions_text, dimensions_focused),
+        field_line("Dimensions:", &dimensions, dimensions_focused),
+        if dimensions_focused {
+            hint_line()
+        } else {
+            Line::from("")
+        },
     ];
 
     let block = Block::default().borders(Borders::ALL).title(title);
