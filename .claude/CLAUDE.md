@@ -1,30 +1,21 @@
 # Story Stick
 
-## Docs conventions
+We are working on a proof of concept for storystick. See @docs/poc.md and the
+README for more background.
 
-`docs/` uses numbered prefixes for the small, fixed set of foundational docs where reading order matters (e.g. `01-product-definition.md`, `02-architecture.md`). Don't number anything else, order between feature docs or decisions isn't meaningful the same way, and renumbering a growing set is churn nobody wants.
+Please start each session by reading all source code under @cli and @core.
+You'll notice that we are keeping core logic separated from the UI/display
+layer. Please keep this strictly enforced. Everything in core should have a well
+defined and testable public interface. The CLI should be built using components that are nested into other components so that we can test business logic in the UI layer without it being coupled to drawing to the screen.
 
-- `docs/features/` — one file per feature, plain descriptive name, no numeric prefix.
-- `docs/decisions/` — architecture decision records (ADRs), numbered sequentially since chronological order is the point. `0001-event-sourcing-core.md`, `0002-...`. Use the template below.
+Please focus on writing clean code not just solving the problem. When you seen
+an opportunity to fix a code smell or an opportunity to improve readability,
+organization, decoupling, improved cohesion or anything else that improves the
+quality of code, you don't hesitate to suggest. Be a true critic of your own
+work, but don't nit pick. Only bring up things that could hurt the ability to
+maintain the code.
 
-Decisions drive the architecture doc, not the other way around: write the ADR first, then reflect the settled decision in the architecture doc. If a call is still open, it belongs in the architecture doc's Open Questions, not a new ADR.
+## Committing
 
-### ADR template
-
-```markdown
-# ADR-NNNN: <Title>
-
-**Status:** Accepted
-
-## Context
-What problem needed solving, what forces were at play.
-
-## Decision
-What was decided.
-
-## Alternatives Considered
-What else was on the table, and why it lost.
-
-## Consequences
-What gets easier, what gets harder, what this commits us to.
-```
+Before commiting work, run `cargo clippy` and `cargo fmt` and fix all issues
+these tools find before commmitting.
