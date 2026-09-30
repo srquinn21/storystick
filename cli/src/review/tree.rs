@@ -10,8 +10,13 @@ use storystick_core::nesting::Material;
 use tui_tree_widget::TreeItem;
 
 enum Node {
-    Folder { order: Vec<String>, children: HashMap<String, Node> },
-    Leaf { part_index: usize },
+    Folder {
+        order: Vec<String>,
+        children: HashMap<String, Node>,
+    },
+    Leaf {
+        part_index: usize,
+    },
 }
 
 /// Deepest folder nesting a row's column alignment compensates for (see
@@ -78,10 +83,20 @@ fn build_nodes(parts: &[Part]) -> (Vec<String>, HashMap<String, Node>) {
 /// between segments) to its part index -- the identifier can differ from
 /// `Part::path` when a same-named sibling forced disambiguation (see
 /// `insert`), so this map is the only correct way back to a part index.
-pub(super) fn build(parts: &[Part], materials: &[Material]) -> (Vec<TreeItem<'static, String>>, HashMap<String, usize>) {
+pub(super) fn build(
+    parts: &[Part],
+    materials: &[Material],
+) -> (Vec<TreeItem<'static, String>>, HashMap<String, usize>) {
     let (order, children) = build_nodes(parts);
     let mut selection_index = HashMap::new();
-    let items = to_items(&order, &children, parts, materials, &[], &mut selection_index);
+    let items = to_items(
+        &order,
+        &children,
+        parts,
+        materials,
+        &[],
+        &mut selection_index,
+    );
     (items, selection_index)
 }
 
@@ -95,9 +110,18 @@ pub(super) fn all_folder_paths(parts: &[Part]) -> Vec<Vec<String>> {
     paths
 }
 
-fn collect_folder_paths(order: &[String], children: &HashMap<String, Node>, prefix: &[String], out: &mut Vec<Vec<String>>) {
+fn collect_folder_paths(
+    order: &[String],
+    children: &HashMap<String, Node>,
+    prefix: &[String],
+    out: &mut Vec<Vec<String>>,
+) {
     for name in order {
-        if let Node::Folder { order: sub_order, children: sub_children } = &children[name] {
+        if let Node::Folder {
+            order: sub_order,
+            children: sub_children,
+        } = &children[name]
+        {
             let mut path: Vec<String> = prefix.to_vec();
             path.push(name.clone());
             out.push(path.clone());
@@ -113,7 +137,12 @@ fn collect_folder_paths(order: &[String], children: &HashMap<String, Node>, pref
 /// instead of silently dropping a part from the tree. The underlying
 /// `Part::path` (and the assignment sidecar's real key, `Part::assignment_key`)
 /// are never touched.
-fn insert(order: &mut Vec<String>, children: &mut HashMap<String, Node>, segments: &[&str], part_index: usize) {
+fn insert(
+    order: &mut Vec<String>,
+    children: &mut HashMap<String, Node>,
+    segments: &[&str],
+    part_index: usize,
+) {
     let head = segments[0].to_string();
     if segments.len() == 1 {
         let mut key = head.clone();
@@ -128,19 +157,39 @@ fn insert(order: &mut Vec<String>, children: &mut HashMap<String, Node>, segment
     }
     if !children.contains_key(&head) {
         order.push(head.clone());
-        children.insert(head.clone(), Node::Folder { order: Vec::new(), children: HashMap::new() });
+        children.insert(
+            head.clone(),
+            Node::Folder {
+                order: Vec::new(),
+                children: HashMap::new(),
+            },
+        );
     }
-    if let Some(Node::Folder { order: sub_order, children: sub_children }) = children.get_mut(&head) {
+    if let Some(Node::Folder {
+        order: sub_order,
+        children: sub_children,
+    }) = children.get_mut(&head)
+    {
         insert(sub_order, sub_children, &segments[1..], part_index);
     }
 }
 
-fn count_flagged(order: &[String], children: &HashMap<String, Node>, parts: &[Part], materials: &[Material]) -> usize {
+fn count_flagged(
+    order: &[String],
+    children: &HashMap<String, Node>,
+    parts: &[Part],
+    materials: &[Material],
+) -> usize {
     order
         .iter()
         .map(|name| match &children[name] {
-            Node::Leaf { part_index } => usize::from(part_flag(&parts[*part_index], materials).is_some()),
-            Node::Folder { order: o, children: c } => count_flagged(o, c, parts, materials),
+            Node::Leaf { part_index } => {
+                usize::from(part_flag(&parts[*part_index], materials).is_some())
+            }
+            Node::Folder {
+                order: o,
+                children: c,
+            } => count_flagged(o, c, parts, materials),
         })
         .sum()
 }
@@ -166,10 +215,21 @@ fn to_items(
                     let flagged = part_flag(part, materials).is_some();
                     TreeItem::new_leaf(name.clone(), leaf_line(part, flagged, depth))
                 }
-                Node::Folder { order: sub_order, children: sub_children } => {
+                Node::Folder {
+                    order: sub_order,
+                    children: sub_children,
+                } => {
                     let flagged = count_flagged(sub_order, sub_children, parts, materials);
-                    let sub_items = to_items(sub_order, sub_children, parts, materials, &path, selection_index);
-                    TreeItem::new(name.clone(), folder_line(name, flagged), sub_items).expect("sibling names disambiguated in `insert`")
+                    let sub_items = to_items(
+                        sub_order,
+                        sub_children,
+                        parts,
+                        materials,
+                        &path,
+                        selection_index,
+                    );
+                    TreeItem::new(name.clone(), folder_line(name, flagged), sub_items)
+                        .expect("sibling names disambiguated in `insert`")
                 }
             }
         })
@@ -197,11 +257,22 @@ pub(super) fn header_line() -> Line<'static> {
 fn leaf_line(part: &Part, flagged: bool, depth: usize) -> Line<'static> {
     let name = part.path.rsplit(" / ").next().unwrap_or(&part.path);
     let marker = if flagged { "! " } else { "  " };
-    let material = part.material.as_ref().map(|m| m.name.as_str()).unwrap_or("-");
+    let material = part
+        .material
+        .as_ref()
+        .map(|m| m.name.as_str())
+        .unwrap_or("-");
     let left = format!("{}{marker}{name:<NAME_FIELD_WIDTH$}", depth_indent(depth));
-    let measurements = format!(" {:>9.4}  {:>9.4}  {:>8.4} ", part.length_in, part.width_in, part.thickness_in);
+    let measurements = format!(
+        " {:>9.4}  {:>9.4}  {:>8.4} ",
+        part.length_in, part.width_in, part.thickness_in
+    );
     let material = format!(" {material}");
-    let style = if flagged { Style::new().fg(Color::Red) } else { Style::default() };
+    let style = if flagged {
+        Style::new().fg(Color::Red)
+    } else {
+        Style::default()
+    };
     Line::from(vec![
         Span::styled(left, style),
         divider(),
@@ -227,7 +298,10 @@ fn leaf_line(part: &Part, flagged: bool, depth: usize) -> Line<'static> {
 fn folder_line(name: &str, flagged: usize) -> Line<'static> {
     let folder_style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
     if flagged > 0 {
-        Line::from(vec![Span::styled(name.to_string(), folder_style), Span::styled(format!("  ({flagged} !)"), Style::new().fg(Color::Red))])
+        Line::from(vec![
+            Span::styled(name.to_string(), folder_style),
+            Span::styled(format!("  ({flagged} !)"), Style::new().fg(Color::Red)),
+        ])
     } else {
         Line::from(Span::styled(name.to_string(), folder_style))
     }
@@ -239,7 +313,10 @@ mod tests {
     use std::collections::HashSet;
 
     fn material(name: &str, thickness_in: f64) -> Material {
-        Material { name: name.to_string(), thickness_mm: thickness_in * 25.4 }
+        Material {
+            name: name.to_string(),
+            thickness_mm: thickness_in * 25.4,
+        }
     }
 
     /// A part with no material assigned (so `part_flag` always flags it by
@@ -269,7 +346,11 @@ mod tests {
         let parts = vec![part("Bench / Top"), part("Bench / Leg")];
         let (items, index) = build(&parts, &[]);
 
-        assert_eq!(items.len(), 1, "both parts share one top-level folder, Bench");
+        assert_eq!(
+            items.len(),
+            1,
+            "both parts share one top-level folder, Bench"
+        );
         assert_eq!(index.len(), 2);
         assert_eq!(index["Bench / Top"], 0);
         assert_eq!(index["Bench / Leg"], 1);
@@ -283,12 +364,20 @@ mod tests {
         let (_items, index) = build(&parts, &[]);
 
         assert_eq!(index.get("Body"), Some(&0));
-        assert_eq!(index.get("Body (2)"), Some(&1), "second collision should get a ` (2)` suffix, not silently drop");
+        assert_eq!(
+            index.get("Body (2)"),
+            Some(&1),
+            "second collision should get a ` (2)` suffix, not silently drop"
+        );
     }
 
     #[test]
     fn build_disambiguates_three_colliding_leaf_names_in_order() {
-        let parts = vec![part("Bench / Body"), part("Bench / Body"), part("Bench / Body")];
+        let parts = vec![
+            part("Bench / Body"),
+            part("Bench / Body"),
+            part("Bench / Body"),
+        ];
         let (_items, index) = build(&parts, &[]);
 
         assert_eq!(index.get("Bench / Body"), Some(&0));
@@ -298,19 +387,33 @@ mod tests {
 
     #[test]
     fn all_folder_paths_lists_every_folder_at_every_depth() {
-        let parts = vec![part("Bench / Carcasses / Carcass A / Body"), part("Bench / Doors / Door A / Body")];
+        let parts = vec![
+            part("Bench / Carcasses / Carcass A / Body"),
+            part("Bench / Doors / Door A / Body"),
+        ];
         let paths: HashSet<Vec<String>> = all_folder_paths(&parts).into_iter().collect();
 
         let expected: HashSet<Vec<String>> = [
             vec!["Bench".to_string()],
             vec!["Bench".to_string(), "Carcasses".to_string()],
-            vec!["Bench".to_string(), "Carcasses".to_string(), "Carcass A".to_string()],
+            vec![
+                "Bench".to_string(),
+                "Carcasses".to_string(),
+                "Carcass A".to_string(),
+            ],
             vec!["Bench".to_string(), "Doors".to_string()],
-            vec!["Bench".to_string(), "Doors".to_string(), "Door A".to_string()],
+            vec![
+                "Bench".to_string(),
+                "Doors".to_string(),
+                "Door A".to_string(),
+            ],
         ]
         .into_iter()
         .collect();
-        assert_eq!(paths, expected, "leaf names (Body) must never appear as folder paths");
+        assert_eq!(
+            paths, expected,
+            "leaf names (Body) must never appear as folder paths"
+        );
     }
 
     #[test]
@@ -330,7 +433,11 @@ mod tests {
         parts[1].material = Some(material("Baltic Birch 3/4", 0.75));
 
         let (order, children) = build_nodes(&parts);
-        assert_eq!(count_flagged(&order, &children, &parts, &materials), 2, "two of the three parts have no material assigned");
+        assert_eq!(
+            count_flagged(&order, &children, &parts, &materials),
+            2,
+            "two of the three parts have no material assigned"
+        );
     }
 
     #[test]

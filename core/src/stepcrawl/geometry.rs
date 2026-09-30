@@ -57,7 +57,11 @@ fn dot3(a: Point3, b: Point3) -> f64 {
 }
 
 fn cross3(a: Point3, b: Point3) -> Point3 {
-    (a.1 * b.2 - a.2 * b.1, a.2 * b.0 - a.0 * b.2, a.0 * b.1 - a.1 * b.0)
+    (
+        a.1 * b.2 - a.2 * b.1,
+        a.2 * b.0 - a.0 * b.2,
+        a.0 * b.1 - a.1 * b.0,
+    )
 }
 
 /// Sample points along the actual swept arc of a CIRCLE/ELLIPSE edge,
@@ -166,7 +170,8 @@ fn walk(
         if let Some(ct) = curve_type {
             if ct != "LINE" {
                 let same_sense = args[4].trim() == ".T.";
-                let arc_points = sample_conic_edge(entities, curve_refs[0], &ct, v1_id, v2_id, same_sense);
+                let arc_points =
+                    sample_conic_edge(entities, curve_refs[0], &ct, v1_id, v2_id, same_sense);
                 if !arc_points.is_empty() {
                     points.extend(arc_points);
                 } else {
@@ -268,7 +273,10 @@ mod tests {
         for i in 0..8 {
             entities.insert(500 + i, format!("ORIENTED_EDGE('',*,*,#{},.T.)", 400 + i));
         }
-        let oriented_refs: String = (0..8).map(|i| format!("#{}", 500 + i)).collect::<Vec<_>>().join(",");
+        let oriented_refs: String = (0..8)
+            .map(|i| format!("#{}", 500 + i))
+            .collect::<Vec<_>>()
+            .join(",");
         entities.insert(600, format!("EDGE_LOOP('',({oriented_refs}))"));
         entities.insert(700, "FACE_BOUND('',#600,.T.)".to_string());
         entities.insert(800, "ADVANCED_FACE('',(#700),#999,.T.)".to_string());

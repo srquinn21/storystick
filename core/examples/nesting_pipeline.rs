@@ -8,8 +8,13 @@ use storystick_core::nesting::{bill_of_materials, pack, Material, PackablePart, 
 const MM_PER_IN: f64 = 25.4;
 
 fn main() {
-    let step_path = PathBuf::from(std::env::args().nth(1).expect("usage: nesting_pipeline <step-file>"));
-    let groups = storystick_core::stepcrawl::extract_parts(&step_path).expect("failed to parse STEP file");
+    let step_path = PathBuf::from(
+        std::env::args()
+            .nth(1)
+            .expect("usage: nesting_pipeline <step-file>"),
+    );
+    let groups =
+        storystick_core::stepcrawl::extract_parts(&step_path).expect("failed to parse STEP file");
 
     // Mirror the real pipeline: dimensions round-trip through parts.csv as
     // inches rounded to 4 decimals before being converted back to mm for
@@ -38,13 +43,34 @@ fn main() {
         .collect();
 
     // Mirrors scripts/stock.example.yaml.
-    let bb34 = Material { name: "Baltic Birch 3/4 (finished 2 sides)".to_string(), thickness_mm: 0.75 * MM_PER_IN };
-    let sande34 = Material { name: "Sande Ply 3/4 (utility, unseen parts)".to_string(), thickness_mm: 0.75 * MM_PER_IN };
-    let bb14 = Material { name: "Baltic Birch 1/4".to_string(), thickness_mm: 0.25 * MM_PER_IN };
+    let bb34 = Material {
+        name: "Baltic Birch 3/4 (finished 2 sides)".to_string(),
+        thickness_mm: 0.75 * MM_PER_IN,
+    };
+    let sande34 = Material {
+        name: "Sande Ply 3/4 (utility, unseen parts)".to_string(),
+        thickness_mm: 0.75 * MM_PER_IN,
+    };
+    let bb14 = Material {
+        name: "Baltic Birch 1/4".to_string(),
+        thickness_mm: 0.25 * MM_PER_IN,
+    };
     let stock = vec![
-        StockSheet { material: bb34, length_mm: 96.0 * MM_PER_IN, width_mm: 48.0 * MM_PER_IN },
-        StockSheet { material: sande34, length_mm: 96.0 * MM_PER_IN, width_mm: 48.0 * MM_PER_IN },
-        StockSheet { material: bb14, length_mm: 96.0 * MM_PER_IN, width_mm: 48.0 * MM_PER_IN },
+        StockSheet {
+            material: bb34,
+            length_mm: 96.0 * MM_PER_IN,
+            width_mm: 48.0 * MM_PER_IN,
+        },
+        StockSheet {
+            material: sande34,
+            length_mm: 96.0 * MM_PER_IN,
+            width_mm: 48.0 * MM_PER_IN,
+        },
+        StockSheet {
+            material: bb14,
+            length_mm: 96.0 * MM_PER_IN,
+            width_mm: 48.0 * MM_PER_IN,
+        },
     ];
 
     let kerf_mm = 0.125 * MM_PER_IN;
@@ -66,7 +92,10 @@ fn main() {
     if !layout.unplaced.is_empty() {
         eprintln!("UNPLACED: {} parts", layout.unplaced.len());
         for p in &layout.unplaced {
-            eprintln!("  {} {}x{}x{}", p.label, p.length_mm, p.width_mm, p.thickness_mm);
+            eprintln!(
+                "  {} {}x{}x{}",
+                p.label, p.length_mm, p.width_mm, p.thickness_mm
+            );
         }
     }
 }

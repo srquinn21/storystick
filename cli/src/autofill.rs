@@ -17,8 +17,13 @@ use storystick_core::tags::extract_tags;
 /// rule. Building/editing `autofill_map` (and what a tag with no rule at
 /// all means) is `crate::project`/`review`'s job, not this function's --
 /// this only ever does the lookup.
-pub(crate) fn guess_material(path: &str, autofill_map: &BTreeMap<String, String>) -> Option<String> {
-    extract_tags(path).iter().find_map(|tag| autofill_map.get(tag).cloned())
+pub(crate) fn guess_material(
+    path: &str,
+    autofill_map: &BTreeMap<String, String>,
+) -> Option<String> {
+    extract_tags(path)
+        .iter()
+        .find_map(|tag| autofill_map.get(tag).cloned())
 }
 
 #[cfg(test)]
@@ -27,15 +32,24 @@ mod tests {
 
     fn autofill_map() -> BTreeMap<String, String> {
         BTreeMap::from([
-            ("[Panel]".to_string(), "Baltic Birch 3/4 (finished 2 sides)".to_string()),
-            ("[Backer]".to_string(), "Sande Ply 3/4 (utility)".to_string()),
+            (
+                "[Panel]".to_string(),
+                "Baltic Birch 3/4 (finished 2 sides)".to_string(),
+            ),
+            (
+                "[Backer]".to_string(),
+                "Sande Ply 3/4 (utility)".to_string(),
+            ),
         ])
     }
 
     #[test]
     fn guesses_the_material_a_tag_claims() {
         let path = "Bench / Carcasses / Carcass A / [Panel] Bottom";
-        assert_eq!(guess_material(path, &autofill_map()), Some("Baltic Birch 3/4 (finished 2 sides)".to_string()));
+        assert_eq!(
+            guess_material(path, &autofill_map()),
+            Some("Baltic Birch 3/4 (finished 2 sides)".to_string())
+        );
     }
 
     #[test]
@@ -56,6 +70,9 @@ mod tests {
         // unusual path (a part nested under a folder whose own name also
         // carries a tag) still resolves deterministically.
         let path = "Bench / [Backer] Section / [Panel] Bottom";
-        assert_eq!(guess_material(path, &autofill_map()), Some("Sande Ply 3/4 (utility)".to_string()));
+        assert_eq!(
+            guess_material(path, &autofill_map()),
+            Some("Sande Ply 3/4 (utility)".to_string())
+        );
     }
 }

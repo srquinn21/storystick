@@ -21,8 +21,9 @@ mod geometry;
 mod parts;
 
 pub use parts::{
-    off_grid, off_grid_default, relabel_with_known_thickness, with_known_thickness, with_known_thickness_default, OffGrid,
-    PartGroup, PartInstance, DEFAULT_GRID_IN, DEFAULT_KNOWN_THICKNESS_TOLERANCE_MM, DEFAULT_OFF_GRID_TOLERANCE_IN,
+    off_grid, off_grid_default, relabel_with_known_thickness, with_known_thickness,
+    with_known_thickness_default, OffGrid, PartGroup, PartInstance, DEFAULT_GRID_IN,
+    DEFAULT_KNOWN_THICKNESS_TOLERANCE_MM, DEFAULT_OFF_GRID_TOLERANCE_IN,
 };
 
 use assembly::build_indices;

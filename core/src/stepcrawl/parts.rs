@@ -67,6 +67,8 @@ fn round3_key(value_in: f64) -> i64 {
 }
 
 type GroupKey = (String, (i64, i64, i64));
+/// One grouped body's own (instance_path, l_mm, w_mm, t_mm, unreliable).
+type GroupedRow = (String, f64, f64, f64, bool);
 
 /// rows: (path, body_name, dx_mm, dy_mm, dz_mm, unreliable) -- one row per
 /// solid body, `path` being its full assembly-folder prefix (root product
@@ -84,12 +86,17 @@ type GroupKey = (String, (i64, i64, i64));
 /// Caller is responsible for row order (e.g. sort by (path, name)) if a
 /// deterministic PartGroup order matters.
 pub fn group_parts(rows: &[(String, String, f64, f64, f64, bool)]) -> Vec<PartGroup> {
-    let mut groups: HashMap<GroupKey, Vec<(String, f64, f64, f64, bool)>> = HashMap::new();
+    let mut groups: HashMap<GroupKey, Vec<GroupedRow>> = HashMap::new();
     let mut order: Vec<GroupKey> = Vec::new();
 
     for (path, name, dx, dy, dz, unreliable) in rows {
         let segments: Vec<&str> = path.split(" / ").collect();
-        let top_folder = if segments.len() > 1 { segments[1] } else { segments[0] }.to_string();
+        let top_folder = if segments.len() > 1 {
+            segments[1]
+        } else {
+            segments[0]
+        }
+        .to_string();
 
         let mut dims = [*dx, *dy, *dz];
         dims.sort_by(|a, b| b.partial_cmp(a).unwrap());
@@ -101,7 +108,11 @@ pub fn group_parts(rows: &[(String, String, f64, f64, f64, bool)]) -> Vec<PartGr
             round3_key(t_mm / MM_PER_IN),
         );
 
-        let path_segments: Vec<&str> = if segments.len() > 1 { segments[1..].to_vec() } else { segments.clone() };
+        let path_segments: Vec<&str> = if segments.len() > 1 {
+            segments[1..].to_vec()
+        } else {
+            segments.clone()
+        };
         let mut instance_parts = path_segments;
         instance_parts.push(name.as_str());
         let instance_path = instance_parts.join(" / ");
@@ -111,7 +122,10 @@ pub fn group_parts(rows: &[(String, String, f64, f64, f64, bool)]) -> Vec<PartGr
             groups.insert(group_key.clone(), Vec::new());
             order.push(group_key.clone());
         }
-        groups.get_mut(&group_key).unwrap().push((instance_path, l_mm, w_mm, t_mm, *unreliable));
+        groups
+            .get_mut(&group_key)
+            .unwrap()
+            .push((instance_path, l_mm, w_mm, t_mm, *unreliable));
     }
 
     order
@@ -122,7 +136,10 @@ pub fn group_parts(rows: &[(String, String, f64, f64, f64, bool)]) -> Vec<PartGr
             let (_, l_mm, w_mm, t_mm, _) = &items[0];
             let instances = items
                 .iter()
-                .map(|(p, _, _, _, u)| PartInstance { path: p.clone(), unreliable: *u })
+                .map(|(p, _, _, _, u)| PartInstance {
+                    path: p.clone(),
+                    unreliable: *u,
+                })
                 .collect();
             PartGroup {
                 top_folder: top_folder.clone(),
@@ -168,10 +185,19 @@ pub fn off_grid_default(part: &PartGroup) -> OffGrid {
 /// within `tolerance_mm` -- a real signal, not just a missed correction:
 /// it means the assigned material doesn't actually match this part's
 /// geometry at all.
-pub fn relabel_with_known_thickness(dims_mm: (f64, f64, f64), thickness_mm: f64, tolerance_mm: f64) -> Result<(f64, f64, f64), String> {
+pub fn relabel_with_known_thickness(
+    dims_mm: (f64, f64, f64),
+    thickness_mm: f64,
+    tolerance_mm: f64,
+) -> Result<(f64, f64, f64), String> {
     let dims = [dims_mm.0, dims_mm.1, dims_mm.2];
     let idx = (0..3usize)
-        .min_by(|&a, &b| (dims[a] - thickness_mm).abs().partial_cmp(&(dims[b] - thickness_mm).abs()).unwrap())
+        .min_by(|&a, &b| {
+            (dims[a] - thickness_mm)
+                .abs()
+                .partial_cmp(&(dims[b] - thickness_mm).abs())
+                .unwrap()
+        })
         .unwrap();
     if (dims[idx] - thickness_mm).abs() > tolerance_mm {
         return Err(format!(
@@ -187,14 +213,30 @@ pub fn relabel_with_known_thickness(dims_mm: (f64, f64, f64), thickness_mm: f64,
 
 /// Relabel `part`'s dimensions given a known material thickness -- see
 /// `relabel_with_known_thickness`.
-pub fn with_known_thickness(part: &PartGroup, thickness_mm: f64, tolerance_mm: f64) -> Result<PartGroup, String> {
-    let (length_mm, width_mm, thickness_mm) =
-        relabel_with_known_thickness((part.length_mm, part.width_mm, part.thickness_mm), thickness_mm, tolerance_mm)
-            .map_err(|e| format!("{} part: {e}", part.top_folder))?;
-    Ok(PartGroup { top_folder: part.top_folder.clone(), length_mm, width_mm, thickness_mm, instances: part.instances.clone() })
+pub fn with_known_thickness(
+    part: &PartGroup,
+    thickness_mm: f64,
+    tolerance_mm: f64,
+) -> Result<PartGroup, String> {
+    let (length_mm, width_mm, thickness_mm) = relabel_with_known_thickness(
+        (part.length_mm, part.width_mm, part.thickness_mm),
+        thickness_mm,
+        tolerance_mm,
+    )
+    .map_err(|e| format!("{} part: {e}", part.top_folder))?;
+    Ok(PartGroup {
+        top_folder: part.top_folder.clone(),
+        length_mm,
+        width_mm,
+        thickness_mm,
+        instances: part.instances.clone(),
+    })
 }
 
-pub fn with_known_thickness_default(part: &PartGroup, thickness_mm: f64) -> Result<PartGroup, String> {
+pub fn with_known_thickness_default(
+    part: &PartGroup,
+    thickness_mm: f64,
+) -> Result<PartGroup, String> {
     with_known_thickness(part, thickness_mm, DEFAULT_KNOWN_THICKNESS_TOLERANCE_MM)
 }
 
@@ -206,15 +248,36 @@ mod tests {
         v * MM_PER_IN
     }
 
-    fn row(path: &str, name: &str, dx: f64, dy: f64, dz: f64, unreliable: bool) -> (String, String, f64, f64, f64, bool) {
+    fn row(
+        path: &str,
+        name: &str,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        unreliable: bool,
+    ) -> (String, String, f64, f64, f64, bool) {
         (path.to_string(), name.to_string(), dx, dy, dz, unreliable)
     }
 
     #[test]
     fn group_parts_counts_identical_dimensions_as_one_group() {
         let rows = vec![
-            row("Root / Bench / Carcasses / Carcass A", "[Panel] Bottom", inch(30.125), inch(16.0), inch(0.75), false),
-            row("Root / Bench / Carcasses / Carcass B", "[Panel] Bottom", inch(30.125), inch(16.0), inch(0.75), false),
+            row(
+                "Root / Bench / Carcasses / Carcass A",
+                "[Panel] Bottom",
+                inch(30.125),
+                inch(16.0),
+                inch(0.75),
+                false,
+            ),
+            row(
+                "Root / Bench / Carcasses / Carcass B",
+                "[Panel] Bottom",
+                inch(30.125),
+                inch(16.0),
+                inch(0.75),
+                false,
+            ),
         ];
 
         let groups = group_parts(&rows);
@@ -227,20 +290,52 @@ mod tests {
     #[test]
     fn group_parts_keeps_mirrored_parts_in_different_top_folders_separate() {
         let rows = vec![
-            row("Root / Console A / Carcasses / Carcass A", "[Panel] Left", inch(29.75), inch(16.0), inch(0.75), false),
-            row("Root / Console B / Carcasses / Carcass B", "[Panel] Right", inch(29.75), inch(16.0), inch(0.75), false),
+            row(
+                "Root / Console A / Carcasses / Carcass A",
+                "[Panel] Left",
+                inch(29.75),
+                inch(16.0),
+                inch(0.75),
+                false,
+            ),
+            row(
+                "Root / Console B / Carcasses / Carcass B",
+                "[Panel] Right",
+                inch(29.75),
+                inch(16.0),
+                inch(0.75),
+                false,
+            ),
         ];
 
         let groups = group_parts(&rows);
 
-        assert_eq!(groups.len(), 2, "identical dims in different top-level folders must stay separate line items");
+        assert_eq!(
+            groups.len(),
+            2,
+            "identical dims in different top-level folders must stay separate line items"
+        );
     }
 
     #[test]
     fn group_parts_tolerates_floating_point_drift() {
         let rows = vec![
-            row("Root / Bench / Carcass A", "[Backer]", inch(31.0) + 1e-6, inch(17.0), inch(0.25), false),
-            row("Root / Bench / Carcass B", "[Backer]", inch(31.0) - 1e-6, inch(17.0), inch(0.25), false),
+            row(
+                "Root / Bench / Carcass A",
+                "[Backer]",
+                inch(31.0) + 1e-6,
+                inch(17.0),
+                inch(0.25),
+                false,
+            ),
+            row(
+                "Root / Bench / Carcass B",
+                "[Backer]",
+                inch(31.0) - 1e-6,
+                inch(17.0),
+                inch(0.25),
+                false,
+            ),
         ];
 
         let groups = group_parts(&rows);
@@ -250,11 +345,21 @@ mod tests {
 
     #[test]
     fn group_parts_instance_path_drops_root_but_keeps_top_folder() {
-        let rows = vec![row("Root Product / Bench / Carcasses / Carcass A", "[Backer]", inch(31.0), inch(17.0), inch(0.25), false)];
+        let rows = vec![row(
+            "Root Product / Bench / Carcasses / Carcass A",
+            "[Backer]",
+            inch(31.0),
+            inch(17.0),
+            inch(0.25),
+            false,
+        )];
 
         let groups = group_parts(&rows);
 
-        assert_eq!(groups[0].instances[0].path, "Bench / Carcasses / Carcass A / [Backer]");
+        assert_eq!(
+            groups[0].instances[0].path,
+            "Bench / Carcasses / Carcass A / [Backer]"
+        );
     }
 
     #[test]
@@ -264,7 +369,10 @@ mod tests {
             length_mm: inch(30.0 + 0.02), // ~0.02" off a 1/16" increment
             width_mm: inch(16.0),
             thickness_mm: inch(0.75),
-            instances: vec![PartInstance { path: "Bench / X".to_string(), unreliable: false }],
+            instances: vec![PartInstance {
+                path: "Bench / X".to_string(),
+                unreliable: false,
+            }],
         };
 
         let result = off_grid(&part, DEFAULT_GRID_IN, 0.005);
@@ -282,7 +390,10 @@ mod tests {
             length_mm: inch(30.0),
             width_mm: inch(16.0),
             thickness_mm: inch(0.75),
-            instances: vec![PartInstance { path: "Bench / X".to_string(), unreliable: false }],
+            instances: vec![PartInstance {
+                path: "Bench / X".to_string(),
+                unreliable: false,
+            }],
         };
 
         let result = off_grid_default(&part);
@@ -299,7 +410,10 @@ mod tests {
             length_mm: inch(24.0),
             width_mm: inch(0.75),
             thickness_mm: inch(0.25),
-            instances: vec![PartInstance { path: "Bench / X".to_string(), unreliable: false }],
+            instances: vec![PartInstance {
+                path: "Bench / X".to_string(),
+                unreliable: false,
+            }],
         };
 
         let corrected = with_known_thickness(&misguessed, inch(0.75), 1.0).unwrap();
@@ -317,7 +431,10 @@ mod tests {
             length_mm: inch(24.0),
             width_mm: inch(16.0),
             thickness_mm: inch(0.75),
-            instances: vec![PartInstance { path: "Bench / X".to_string(), unreliable: false }],
+            instances: vec![PartInstance {
+                path: "Bench / X".to_string(),
+                unreliable: false,
+            }],
         };
 
         assert!(with_known_thickness(&part, inch(0.25), 1.0).is_err());

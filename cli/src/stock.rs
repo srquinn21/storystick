@@ -71,9 +71,16 @@ pub(crate) fn parse(text: &str) -> Result<Vec<StockSheet>, Box<dyn Error>> {
 
     let mut stock = Vec::new();
     for entry in doc.materials {
-        let material = Material { name: entry.name, thickness_mm: entry.thickness_in * MM_PER_IN };
+        let material = Material {
+            name: entry.name,
+            thickness_mm: entry.thickness_in * MM_PER_IN,
+        };
         for sheet in entry.sheets {
-            stock.push(StockSheet { material: material.clone(), length_mm: sheet.length_in * MM_PER_IN, width_mm: sheet.width_in * MM_PER_IN });
+            stock.push(StockSheet {
+                material: material.clone(),
+                length_mm: sheet.length_in * MM_PER_IN,
+                width_mm: sheet.width_in * MM_PER_IN,
+            });
         }
     }
     Ok(stock)
@@ -127,7 +134,10 @@ materials:
         let stock = parse(yaml).unwrap();
 
         assert_eq!(stock.len(), 2);
-        assert_eq!(stock[0].material.name, "Baltic Birch 3/4 (finished 2 sides)");
+        assert_eq!(
+            stock[0].material.name,
+            "Baltic Birch 3/4 (finished 2 sides)"
+        );
         assert!((stock[0].material.thickness_mm - 0.75 * MM_PER_IN).abs() < 1e-9);
         assert!((stock[0].length_mm - 96.0 * MM_PER_IN).abs() < 1e-9);
         assert!((stock[0].width_mm - 48.0 * MM_PER_IN).abs() < 1e-9);
@@ -149,7 +159,10 @@ materials:
 "#;
         let stock = parse(yaml).unwrap();
         assert_eq!(stock.len(), 2);
-        assert_eq!(stock[0].material.thickness_mm, stock[1].material.thickness_mm);
+        assert_eq!(
+            stock[0].material.thickness_mm,
+            stock[1].material.thickness_mm
+        );
     }
 
     #[test]
@@ -179,7 +192,10 @@ sheets:
     width_in: 48
 "#;
         let err = parse(yaml).unwrap_err();
-        assert!(err.to_string().contains("sheets"), "error should name the stray top-level field: {err}");
+        assert!(
+            err.to_string().contains("sheets"),
+            "error should name the stray top-level field: {err}"
+        );
     }
 
     #[test]
@@ -189,12 +205,30 @@ sheets:
 
     #[test]
     fn distinct_materials_dedupes_by_name_preserving_first_appearance_order() {
-        let bb34 = Material { name: "Baltic Birch 3/4".to_string(), thickness_mm: 19.05 };
-        let sande34 = Material { name: "Sande Ply 3/4".to_string(), thickness_mm: 19.05 };
+        let bb34 = Material {
+            name: "Baltic Birch 3/4".to_string(),
+            thickness_mm: 19.05,
+        };
+        let sande34 = Material {
+            name: "Sande Ply 3/4".to_string(),
+            thickness_mm: 19.05,
+        };
         let stock = vec![
-            StockSheet { material: bb34.clone(), length_mm: 2438.4, width_mm: 1219.2 },
-            StockSheet { material: sande34, length_mm: 2438.4, width_mm: 1219.2 },
-            StockSheet { material: bb34, length_mm: 1219.2, width_mm: 609.6 },
+            StockSheet {
+                material: bb34.clone(),
+                length_mm: 2438.4,
+                width_mm: 1219.2,
+            },
+            StockSheet {
+                material: sande34,
+                length_mm: 2438.4,
+                width_mm: 1219.2,
+            },
+            StockSheet {
+                material: bb34,
+                length_mm: 1219.2,
+                width_mm: 609.6,
+            },
         ];
         let distinct = distinct_materials(&stock);
         let names: Vec<&str> = distinct.iter().map(|m| m.name.as_str()).collect();

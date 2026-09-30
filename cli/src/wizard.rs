@@ -32,7 +32,11 @@ fn find_step_candidates(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("step") || ext.eq_ignore_ascii_case("stp")))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("step") || ext.eq_ignore_ascii_case("stp")
+            })
+        })
         .collect();
     candidates.sort();
     Ok(candidates)
@@ -42,7 +46,10 @@ fn find_step_candidates(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
 /// pure, so the "did the user type something sane" logic is testable
 /// without stdin.
 fn parse_index(input: &str, len: usize) -> Result<usize, String> {
-    let n: usize = input.trim().parse().map_err(|_| format!("{input:?} isn't a number"))?;
+    let n: usize = input
+        .trim()
+        .parse()
+        .map_err(|_| format!("{input:?} isn't a number"))?;
     if n == 0 || n > len {
         return Err(format!("{n} is out of range (1-{len})"));
     }
@@ -74,7 +81,11 @@ fn pick_step_file(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
         _ => {
             println!("Multiple STEP files found in {}:", dir.display());
             for (i, path) in candidates.iter().enumerate() {
-                println!("  {}) {}", i + 1, path.file_name().unwrap_or_default().to_string_lossy());
+                println!(
+                    "  {}) {}",
+                    i + 1,
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
             }
             loop {
                 let input = prompt_line("Pick one (number): ")?;
@@ -88,7 +99,10 @@ fn pick_step_file(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
 }
 
 fn pick_materials(global_stock: &[StockSheet]) -> Result<Vec<String>, Box<dyn Error>> {
-    let names: Vec<String> = stock::distinct_materials(global_stock).into_iter().map(|m| m.name).collect();
+    let names: Vec<String> = stock::distinct_materials(global_stock)
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
     if names.is_empty() {
         return Err("the stock catalog has no materials -- add some to stock.yaml first".into());
     }
@@ -111,14 +125,31 @@ fn pick_materials(global_stock: &[StockSheet]) -> Result<Vec<String>, Box<dyn Er
 /// `storystick.yaml` there, and returns it loaded -- ready for
 /// `review::run` to continue straight into, with no second invocation
 /// needed.
-pub(crate) fn create(dir: &Path, global_stock: &[StockSheet]) -> Result<(Project, PathBuf), Box<dyn Error>> {
-    println!("No {} found above {} -- let's set one up.", crate::project::FILENAME, dir.display());
+pub(crate) fn create(
+    dir: &Path,
+    global_stock: &[StockSheet],
+) -> Result<(Project, PathBuf), Box<dyn Error>> {
+    println!(
+        "No {} found above {} -- let's set one up.",
+        crate::project::FILENAME,
+        dir.display()
+    );
 
     let step_file = pick_step_file(dir)?;
-    let step = step_file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let step = step_file
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     let materials = pick_materials(global_stock)?;
 
-    let project = Project { step, materials, autofill: BTreeMap::new(), settings: Settings::default(), assignments: BTreeMap::new() };
+    let project = Project {
+        step,
+        materials,
+        autofill: BTreeMap::new(),
+        settings: Settings::default(),
+        assignments: BTreeMap::new(),
+    };
     let project_path = dir.join(crate::project::FILENAME);
     crate::project::save(&project, &project_path)?;
     println!("Created {}", project_path.display());
@@ -151,8 +182,18 @@ mod tests {
 
     #[test]
     fn parse_material_selection_parses_comma_separated_indices() {
-        let names = vec!["Baltic Birch 3/4".to_string(), "Sande Ply 3/4".to_string(), "Baltic Birch 1/4".to_string()];
-        assert_eq!(parse_material_selection("2, 1", &names), Ok(vec!["Sande Ply 3/4".to_string(), "Baltic Birch 3/4".to_string()]));
+        let names = vec![
+            "Baltic Birch 3/4".to_string(),
+            "Sande Ply 3/4".to_string(),
+            "Baltic Birch 1/4".to_string(),
+        ];
+        assert_eq!(
+            parse_material_selection("2, 1", &names),
+            Ok(vec![
+                "Sande Ply 3/4".to_string(),
+                "Baltic Birch 3/4".to_string()
+            ])
+        );
     }
 
     #[test]

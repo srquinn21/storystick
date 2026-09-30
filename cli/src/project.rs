@@ -40,7 +40,11 @@ pub(crate) struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { kerf_in: default_kerf_in(), trim_allowance_in: 0.0, out_pdf: default_out_pdf() }
+        Settings {
+            kerf_in: default_kerf_in(),
+            trim_allowance_in: 0.0,
+            out_pdf: default_out_pdf(),
+        }
     }
 }
 
@@ -90,7 +94,10 @@ impl Project {
     /// name if a material this project uses no longer exists there (the
     /// shop catalog changed out from under this project), rather than
     /// silently dropping it.
-    pub(crate) fn resolve_materials(&self, global: &[Material]) -> Result<Vec<Material>, Box<dyn Error>> {
+    pub(crate) fn resolve_materials(
+        &self,
+        global: &[Material],
+    ) -> Result<Vec<Material>, Box<dyn Error>> {
         self.materials
             .iter()
             .map(|name| {
@@ -98,7 +105,9 @@ impl Project {
                     .iter()
                     .find(|m| &m.name == name)
                     .cloned()
-                    .ok_or_else(|| format!("storystick.yaml: material {name:?} not found in the stock catalog"))
+                    .ok_or_else(|| {
+                        format!("storystick.yaml: material {name:?} not found in the stock catalog")
+                    })
             })
             .collect::<Result<Vec<Material>, String>>()
             .map_err(Into::into)
@@ -107,7 +116,11 @@ impl Project {
     /// Every sheet in `global` whose material is part of this project's
     /// subset -- what `pack()` is actually allowed to nest onto.
     pub(crate) fn resolve_stock(&self, global: &[StockSheet]) -> Vec<StockSheet> {
-        global.iter().filter(|s| self.materials.iter().any(|m| m == &s.material.name)).cloned().collect()
+        global
+            .iter()
+            .filter(|s| self.materials.iter().any(|m| m == &s.material.name))
+            .cloned()
+            .collect()
     }
 
     /// Every `autofill` value and `assignments[].material` must name a
@@ -128,13 +141,21 @@ impl Project {
         let known: Vec<&str> = materials.iter().map(|m| m.name.as_str()).collect();
         for (tag, name) in &self.autofill {
             if !known.contains(&name.as_str()) {
-                return Err(unresolved_material_err(&format!("autofill rule {tag:?}"), name, &known));
+                return Err(unresolved_material_err(
+                    &format!("autofill rule {tag:?}"),
+                    name,
+                    &known,
+                ));
             }
         }
         for (key, over) in &self.assignments {
             if let Some(name) = &over.material {
                 if !known.contains(&name.as_str()) {
-                    return Err(unresolved_material_err(&format!("assignment for {key:?}"), name, &known));
+                    return Err(unresolved_material_err(
+                        &format!("assignment for {key:?}"),
+                        name,
+                        &known,
+                    ));
                 }
             }
         }
@@ -143,7 +164,9 @@ impl Project {
 }
 
 fn unresolved_material_err(context: &str, name: &str, known: &[&str]) -> Box<dyn Error> {
-    let suggestion = closest_match(name, known).map(|m| format!(" (did you mean {m:?}?)")).unwrap_or_default();
+    let suggestion = closest_match(name, known)
+        .map(|m| format!(" (did you mean {m:?}?)"))
+        .unwrap_or_default();
     format!("storystick.yaml: {context} -> material {name:?} not found in this project's materials{suggestion}").into()
 }
 
@@ -155,7 +178,12 @@ fn unresolved_material_err(context: &str, name: &str, known: &[&str]) -> Box<dyn
 /// inexact match must never silently stand in for an exact one.
 fn closest_match<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str> {
     let max_distance = (target.chars().count() / 3).max(1);
-    candidates.iter().map(|c| (*c, levenshtein(target, c))).filter(|(_, d)| *d <= max_distance).min_by_key(|(_, d)| *d).map(|(c, _)| c)
+    candidates
+        .iter()
+        .map(|c| (*c, levenshtein(target, c)))
+        .filter(|(_, d)| *d <= max_distance)
+        .min_by_key(|(_, d)| *d)
+        .map(|(c, _)| c)
 }
 
 /// Classic edit distance, one DP row kept at a time -- no crate dependency
@@ -202,8 +230,15 @@ pub(crate) fn save(project: &Project, path: &Path) -> Result<(), Box<dyn Error>>
 /// filesystem root), git-style, for the first directory containing
 /// `filename` -- pure over an injected `exists` predicate so it's testable
 /// without touching a real filesystem; `discover` is the real thing.
-pub(crate) fn find_project_file(start: &Path, filename: &str, exists: impl Fn(&Path) -> bool) -> Option<PathBuf> {
-    start.ancestors().map(|dir| dir.join(filename)).find(|candidate| exists(candidate))
+pub(crate) fn find_project_file(
+    start: &Path,
+    filename: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .map(|dir| dir.join(filename))
+        .find(|candidate| exists(candidate))
 }
 
 pub(crate) fn discover(start: &Path) -> Option<PathBuf> {
@@ -216,7 +251,10 @@ mod tests {
     use std::collections::HashSet;
 
     fn material(name: &str, thickness_mm: f64) -> Material {
-        Material { name: name.to_string(), thickness_mm }
+        Material {
+            name: name.to_string(),
+            thickness_mm,
+        }
     }
 
     #[test]
@@ -241,7 +279,12 @@ assignments:
         assert_eq!(project.materials, vec!["Baltic Birch 3/4", "Sande Ply 3/4"]);
         assert_eq!(project.autofill["[Panel]"], "Baltic Birch 3/4");
         assert_eq!(project.settings.trim_allowance_in, 0.25);
-        assert_eq!(project.assignments["Bench / Body @ 30.0000x20.0000x0.7500"].material.as_deref(), Some("Sande Ply 3/4"));
+        assert_eq!(
+            project.assignments["Bench / Body @ 30.0000x20.0000x0.7500"]
+                .material
+                .as_deref(),
+            Some("Sande Ply 3/4")
+        );
     }
 
     #[test]
@@ -255,7 +298,8 @@ assignments:
 
     #[test]
     fn save_and_load_round_trip() {
-        let dir = std::env::temp_dir().join(format!("storystick-project-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("storystick-project-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILENAME);
 
@@ -280,17 +324,29 @@ assignments:
             step: "model.step".to_string(),
             materials: vec![],
             autofill: BTreeMap::new(),
-            settings: Settings { out_pdf: "out/cutlist.pdf".to_string(), ..Settings::default() },
+            settings: Settings {
+                out_pdf: "out/cutlist.pdf".to_string(),
+                ..Settings::default()
+            },
             assignments: BTreeMap::new(),
         };
         let project_file = Path::new("/projects/bench/storystick.yaml");
-        assert_eq!(project.step_path(project_file), Path::new("/projects/bench/model.step"));
-        assert_eq!(project.out_pdf_path(project_file), Path::new("/projects/bench/out/cutlist.pdf"));
+        assert_eq!(
+            project.step_path(project_file),
+            Path::new("/projects/bench/model.step")
+        );
+        assert_eq!(
+            project.out_pdf_path(project_file),
+            Path::new("/projects/bench/out/cutlist.pdf")
+        );
     }
 
     #[test]
     fn resolve_materials_looks_up_by_name_against_the_global_catalog() {
-        let global = vec![material("Baltic Birch 3/4", 19.05), material("Baltic Birch 1/4", 6.35)];
+        let global = vec![
+            material("Baltic Birch 3/4", 19.05),
+            material("Baltic Birch 1/4", 6.35),
+        ];
         let project = Project {
             step: "model.step".to_string(),
             materials: vec!["Baltic Birch 3/4".to_string()],
@@ -321,8 +377,16 @@ assignments:
         let bb34 = material("Baltic Birch 3/4", 19.05);
         let sande34 = material("Sande Ply 3/4", 19.05);
         let global = vec![
-            StockSheet { material: bb34, length_mm: 2438.4, width_mm: 1219.2 },
-            StockSheet { material: sande34, length_mm: 2438.4, width_mm: 1219.2 },
+            StockSheet {
+                material: bb34,
+                length_mm: 2438.4,
+                width_mm: 1219.2,
+            },
+            StockSheet {
+                material: sande34,
+                length_mm: 2438.4,
+                width_mm: 1219.2,
+            },
         ];
         let project = Project {
             step: "model.step".to_string(),
@@ -338,11 +402,20 @@ assignments:
 
     #[test]
     fn validate_references_passes_when_autofill_and_assignments_name_real_materials() {
-        let materials = vec![material("Baltic Birch 3/4", 19.05), material("Sande Ply 3/4", 19.05)];
+        let materials = vec![
+            material("Baltic Birch 3/4", 19.05),
+            material("Sande Ply 3/4", 19.05),
+        ];
         let mut autofill = BTreeMap::new();
         autofill.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
         let mut assignments = BTreeMap::new();
-        assignments.insert("Bench / Body".to_string(), PartOverride { material: Some("Sande Ply 3/4".to_string()), swapped: false });
+        assignments.insert(
+            "Bench / Body".to_string(),
+            PartOverride {
+                material: Some("Sande Ply 3/4".to_string()),
+                swapped: false,
+            },
+        );
         let project = Project {
             step: "model.step".to_string(),
             materials: vec!["Baltic Birch 3/4".to_string(), "Sande Ply 3/4".to_string()],
@@ -365,17 +438,36 @@ assignments:
             settings: Settings::default(),
             assignments: BTreeMap::new(),
         };
-        let err = project.validate_references(&materials).unwrap_err().to_string();
-        assert!(err.contains("[Panel]"), "should name the offending rule: {err}");
-        assert!(err.contains("Baltic Brich 3/4"), "should name the bad value: {err}");
-        assert!(err.contains("did you mean \"Baltic Birch 3/4\""), "should suggest the close match: {err}");
+        let err = project
+            .validate_references(&materials)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[Panel]"),
+            "should name the offending rule: {err}"
+        );
+        assert!(
+            err.contains("Baltic Brich 3/4"),
+            "should name the bad value: {err}"
+        );
+        assert!(
+            err.contains("did you mean \"Baltic Birch 3/4\""),
+            "should suggest the close match: {err}"
+        );
     }
 
     #[test]
-    fn validate_references_errs_on_an_unknown_assignment_material_with_no_suggestion_when_nothing_is_close() {
+    fn validate_references_errs_on_an_unknown_assignment_material_with_no_suggestion_when_nothing_is_close(
+    ) {
         let materials = vec![material("Baltic Birch 3/4", 19.05)];
         let mut assignments = BTreeMap::new();
-        assignments.insert("Bench / Body".to_string(), PartOverride { material: Some("Oak".to_string()), swapped: false });
+        assignments.insert(
+            "Bench / Body".to_string(),
+            PartOverride {
+                material: Some("Oak".to_string()),
+                swapped: false,
+            },
+        );
         let project = Project {
             step: "model.step".to_string(),
             materials: vec!["Baltic Birch 3/4".to_string()],
@@ -383,32 +475,57 @@ assignments:
             settings: Settings::default(),
             assignments,
         };
-        let err = project.validate_references(&materials).unwrap_err().to_string();
-        assert!(err.contains("Bench / Body"), "should name the offending assignment key: {err}");
+        let err = project
+            .validate_references(&materials)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Bench / Body"),
+            "should name the offending assignment key: {err}"
+        );
         assert!(err.contains("Oak"), "should name the bad value: {err}");
-        assert!(!err.contains("did you mean"), "\"Oak\" isn't a plausible typo of \"Baltic Birch 3/4\": {err}");
+        assert!(
+            !err.contains("did you mean"),
+            "\"Oak\" isn't a plausible typo of \"Baltic Birch 3/4\": {err}"
+        );
     }
 
     #[test]
     fn find_project_file_walks_up_from_a_subdirectory() {
-        let existing: HashSet<PathBuf> = [PathBuf::from("/projects/bench/storystick.yaml")].into_iter().collect();
+        let existing: HashSet<PathBuf> = [PathBuf::from("/projects/bench/storystick.yaml")]
+            .into_iter()
+            .collect();
         let start = Path::new("/projects/bench/Carcasses/Left");
         let found = find_project_file(start, "storystick.yaml", |p| existing.contains(p));
-        assert_eq!(found, Some(PathBuf::from("/projects/bench/storystick.yaml")));
+        assert_eq!(
+            found,
+            Some(PathBuf::from("/projects/bench/storystick.yaml"))
+        );
     }
 
     #[test]
     fn find_project_file_prefers_the_nearest_ancestor() {
-        let existing: HashSet<PathBuf> =
-            [PathBuf::from("/projects/storystick.yaml"), PathBuf::from("/projects/bench/storystick.yaml")].into_iter().collect();
+        let existing: HashSet<PathBuf> = [
+            PathBuf::from("/projects/storystick.yaml"),
+            PathBuf::from("/projects/bench/storystick.yaml"),
+        ]
+        .into_iter()
+        .collect();
         let start = Path::new("/projects/bench/Carcasses");
         let found = find_project_file(start, "storystick.yaml", |p| existing.contains(p));
-        assert_eq!(found, Some(PathBuf::from("/projects/bench/storystick.yaml")));
+        assert_eq!(
+            found,
+            Some(PathBuf::from("/projects/bench/storystick.yaml"))
+        );
     }
 
     #[test]
     fn find_project_file_returns_none_when_nothing_exists_up_to_the_root() {
-        let found = find_project_file(Path::new("/projects/bench/Carcasses"), "storystick.yaml", |_| false);
+        let found = find_project_file(
+            Path::new("/projects/bench/Carcasses"),
+            "storystick.yaml",
+            |_| false,
+        );
         assert_eq!(found, None);
     }
 }

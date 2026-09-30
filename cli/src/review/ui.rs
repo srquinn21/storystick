@@ -26,7 +26,8 @@ const TREE_HELP: &[(&str, &str)] = &[
 
 /// Shown on the bottom status line while bulk-edit's tag list (see
 /// `BulkState`) has focus.
-const BULK_TAG_HELP: &[(&str, &str)] = &[("j/k", "move"), ("Enter", "set material"), ("Esc", "done")];
+const BULK_TAG_HELP: &[(&str, &str)] =
+    &[("j/k", "move"), ("Enter", "set material"), ("Esc", "done")];
 
 /// Shown on the bottom status line while a material picker (`App::picker`,
 /// either a single part's or a bulk-edit tag's) has focus.
@@ -35,13 +36,21 @@ const PICKER_HELP: &[(&str, &str)] = &[("j/k", "move"), ("Enter", "confirm"), ("
 /// Shown on the bottom status line (see `draw_status`) while the
 /// print-settings popup has focus, replacing the tree's own keyboard
 /// help -- none of those keys apply while this popup is open.
-const PRINT_HELP: &[(&str, &str)] = &[("Tab", "switch field"), ("Enter", "print"), ("Esc", "cancel")];
+const PRINT_HELP: &[(&str, &str)] = &[
+    ("Tab", "switch field"),
+    ("Enter", "print"),
+    ("Esc", "cancel"),
+];
 
 /// Shown on the bottom status line while the "save before exiting?"
 /// popup has focus. `y`/`Enter` are listed together since `Enter` is
 /// just the capitalized default in the popup's own "[Y/n]" -- see
 /// `run`'s `confirm_quit` handling.
-const QUIT_HELP: &[(&str, &str)] = &[("y/Enter", "save & quit"), ("n", "quit without saving"), ("Esc", "cancel")];
+const QUIT_HELP: &[(&str, &str)] = &[
+    ("y/Enter", "save & quit"),
+    ("n", "quit without saving"),
+    ("Esc", "cancel"),
+];
 
 /// Plain-text rendering of a help line's (key, action) pairs -- used for
 /// `App::default_status`, which is compared for equality (see
@@ -52,7 +61,11 @@ pub(super) fn tree_help_text() -> String {
 }
 
 fn plain_help_text(pairs: &[(&str, &str)]) -> String {
-    pairs.iter().map(|(key, action)| format!("{key} {action}")).collect::<Vec<_>>().join(", ")
+    pairs
+        .iter()
+        .map(|(key, action)| format!("{key} {action}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Renders a help line with each key in blue and what it does in dark
@@ -65,7 +78,10 @@ fn help_line(pairs: &[(&str, &str)]) -> Line<'static> {
         }
         spans.push(Span::styled(key.to_string(), Style::new().fg(Color::Blue)));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(action.to_string(), Style::new().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            action.to_string(),
+            Style::new().fg(Color::DarkGray),
+        ));
     }
     Line::from(spans)
 }
@@ -76,7 +92,14 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     // terminal multiplexer's own status bar (tmux, etc.) directly below --
     // that last row is simply never drawn into, left as the terminal's
     // default blank background.
-    let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)]).split(area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
 
     draw_tree(frame, chunks[0], app);
     draw_status(frame, chunks[1], app);
@@ -107,14 +130,25 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &mut App) {
     // `part_flag` left standing), then green -- the count is the one
     // thing in the title actually worth a glance-and-go signal; the rest
     // of the title is just identifying which file this is.
-    let count_color = if total > 0 && resolved == total { Color::Green } else { Color::Red };
+    let count_color = if total > 0 && resolved == total {
+        Color::Green
+    } else {
+        Color::Red
+    };
     // The full path is mostly the same directory over and over across a
     // multi-file project (e.g. this model's own `-Carcass`/`-Uppers`
     // siblings) -- the file name is the part that actually distinguishes
     // one run's title from another.
-    let file_name = app.step_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| app.step_path.display().to_string());
+    let file_name = app
+        .step_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| app.step_path.display().to_string());
     let left_spans = vec![
-        Span::styled(" storystick -- ", Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " storystick -- ",
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(file_name),
     ];
     // `[modified]` goes last so it sits at the very right edge of the
@@ -122,7 +156,10 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &mut App) {
     // changes) should be the last thing pushed off the edge, not buried
     // in the middle of the right-aligned group.
     let mut right_spans = vec![
-        Span::styled(format!("{resolved}/{total}"), Style::new().fg(count_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{resolved}/{total}"),
+            Style::new().fg(count_color).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" resolved"),
     ];
     if app.dirty {
@@ -137,11 +174,17 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &mut App) {
     // Two separate titles (rather than one line with padding in between)
     // so the resolved count stays pinned to the border's right edge
     // regardless of how long the file name is.
-    let block = Block::default().borders(Borders::ALL).title_top(Line::from(left_spans)).title_top(right_title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title_top(Line::from(left_spans))
+        .title_top(right_title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
     frame.render_widget(Paragraph::new(tree::header_line()), rows[0]);
 
     let widget = Tree::new(&items)
@@ -198,15 +241,28 @@ fn popup_width(min: u16, lines: impl Iterator<Item = usize>) -> u16 {
 }
 
 fn draw_picker(frame: &mut Frame, area: Rect, app: &mut App) {
-    let Some(picker) = &mut app.picker else { return };
+    let Some(picker) = &mut app.picker else {
+        return;
+    };
     let title = match &picker.target {
         PickerTarget::Part(_) => " pick a material ".to_string(),
         PickerTarget::Tag(tag) => format!(" pick a material for {tag} "),
     };
-    let width = popup_width(50, picker.options.iter().map(|o| o.chars().count()).chain(std::iter::once(title.chars().count())));
+    let width = popup_width(
+        50,
+        picker
+            .options
+            .iter()
+            .map(|o| o.chars().count())
+            .chain(std::iter::once(title.chars().count())),
+    );
     let popup = centered_rect(width, (picker.options.len() as u16 + 4).min(20), area);
 
-    let items: Vec<ListItem> = picker.options.iter().map(|name| ListItem::new(name.as_str())).collect();
+    let items: Vec<ListItem> = picker
+        .options
+        .iter()
+        .map(|name| ListItem::new(name.as_str()))
+        .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD))
@@ -222,7 +278,9 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &mut App) {
 /// `App::bulk_pick_tag` hands off to `App::picker` -- `draw` orders the
 /// two calls so that picker isn't hidden behind this one.
 fn draw_bulk(frame: &mut Frame, area: Rect, app: &mut App) {
-    let Some(BulkState::PickTag { tags, list_state }) = &mut app.bulk else { return };
+    let Some(BulkState::PickTag { tags, list_state }) = &mut app.bulk else {
+        return;
+    };
     let title = " bulk edit ";
     let labels: Vec<String> = tags
         .iter()
@@ -231,7 +289,13 @@ fn draw_bulk(frame: &mut Frame, area: Rect, app: &mut App) {
             None => format!("{tag}  ({count})"),
         })
         .collect();
-    let width = popup_width(50, labels.iter().map(|l| l.chars().count()).chain(std::iter::once(title.chars().count())));
+    let width = popup_width(
+        50,
+        labels
+            .iter()
+            .map(|l| l.chars().count())
+            .chain(std::iter::once(title.chars().count())),
+    );
     let popup = centered_rect(width, (tags.len() as u16 + 4).min(20), area);
     let items: Vec<ListItem> = labels.into_iter().map(ListItem::new).collect();
     let list = List::new(items)
@@ -244,8 +308,16 @@ fn draw_bulk(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_confirm_quit(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(46, 4, area);
-    let lines = vec![Line::from(""), Line::styled(" Save changes before exiting?  [Y/n]", Style::new().fg(Color::Yellow))];
-    let block = Block::default().borders(Borders::ALL).title(" Unsaved Changes ");
+    let lines = vec![
+        Line::from(""),
+        Line::styled(
+            " Save changes before exiting?  [Y/n]",
+            Style::new().fg(Color::Yellow),
+        ),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Unsaved Changes ");
     let paragraph = Paragraph::new(lines).block(block);
 
     frame.render_widget(Clear, popup);
@@ -253,22 +325,37 @@ fn draw_confirm_quit(frame: &mut Frame, area: Rect) {
 }
 
 fn draw_print_settings(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(ps) = &app.print_settings else { return };
+    let Some(ps) = &app.print_settings else {
+        return;
+    };
     let popup = centered_rect(56, 6, area);
 
     let field_line = |label: &str, value: &str, focused: bool| {
         let cursor = if focused { "_" } else { "" };
         let text = format!(" {label:<22}{value}{cursor}");
-        if focused { Line::styled(text, Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD)) } else { Line::from(text) }
+        if focused {
+            Line::styled(
+                text,
+                Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Line::from(text)
+        }
     };
 
     let lines = vec![
         field_line("Kerf (in):", &ps.kerf_in, ps.focus == PrintField::Kerf),
         Line::from(""),
-        field_line("Trim allowance (in):", &ps.trim_allowance_in, ps.focus == PrintField::TrimAllowance),
+        field_line(
+            "Trim allowance (in):",
+            &ps.trim_allowance_in,
+            ps.focus == PrintField::TrimAllowance,
+        ),
     ];
 
-    let block = Block::default().borders(Borders::ALL).title(" Print Project Plan ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Print Project Plan ");
     let paragraph = Paragraph::new(lines).block(block);
 
     frame.render_widget(Clear, popup);

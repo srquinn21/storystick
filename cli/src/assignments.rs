@@ -52,17 +52,26 @@ mod tests {
 
     #[test]
     fn material_only_override_omits_the_swapped_line() {
-        let over = PartOverride { material: Some("Baltic Birch 3/4".to_string()), swapped: false };
+        let over = PartOverride {
+            material: Some("Baltic Birch 3/4".to_string()),
+            swapped: false,
+        };
         let yaml = yaml_serde::to_string(&over).unwrap();
         assert_eq!(yaml.trim(), "material: Baltic Birch 3/4");
     }
 
     #[test]
     fn swap_only_override_omits_the_material_line_and_is_not_empty() {
-        let over = PartOverride { material: None, swapped: true };
+        let over = PartOverride {
+            material: None,
+            swapped: true,
+        };
         let yaml = yaml_serde::to_string(&over).unwrap();
         assert_eq!(yaml.trim(), "swapped: true");
-        assert!(!over.is_empty(), "a swap-only override must still be worth saving");
+        assert!(
+            !over.is_empty(),
+            "a swap-only override must still be worth saving"
+        );
     }
 
     #[test]
@@ -70,7 +79,10 @@ mod tests {
         let over = PartOverride::default();
         assert!(over.is_empty());
 
-        let with_both = PartOverride { material: Some("Sande Ply 3/4".to_string()), swapped: true };
+        let with_both = PartOverride {
+            material: Some("Sande Ply 3/4".to_string()),
+            swapped: true,
+        };
         let yaml = yaml_serde::to_string(&with_both).unwrap();
         let back: PartOverride = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(back.material.as_deref(), Some("Sande Ply 3/4"));

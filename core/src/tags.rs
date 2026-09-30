@@ -22,7 +22,10 @@ fn tag_re() -> &'static Regex {
 /// not deduped -- a caller building a distinct set (e.g. bulk-edit's tag
 /// listing) does that itself, across many paths at once.
 pub fn extract_tags(path: &str) -> Vec<String> {
-    tag_re().find_iter(path).map(|m| m.as_str().to_string()).collect()
+    tag_re()
+        .find_iter(path)
+        .map(|m| m.as_str().to_string())
+        .collect()
 }
 
 /// Classifies `path` by the first rule (in order) whose `keyword` appears
@@ -36,7 +39,10 @@ pub fn extract_tags(path: &str) -> Vec<String> {
 /// brackets. Returns `None` when no rule matches, for the caller to fall
 /// back on (e.g. an "Unsectioned" bucket) -- this never guesses.
 pub fn classify_by_keyword(path: &str, rules: &[(&str, &str)]) -> Option<String> {
-    rules.iter().find(|(keyword, _)| path.contains(keyword)).map(|(_, label)| label.to_string())
+    rules
+        .iter()
+        .find(|(keyword, _)| path.contains(keyword))
+        .map(|(_, label)| label.to_string())
 }
 
 #[cfg(test)]
@@ -45,12 +51,18 @@ mod tests {
 
     #[test]
     fn extract_tags_finds_a_single_bracket_token() {
-        assert_eq!(extract_tags("Bench / Carcasses / Carcass A / [Panel] Bottom"), vec!["[Panel]"]);
+        assert_eq!(
+            extract_tags("Bench / Carcasses / Carcass A / [Panel] Bottom"),
+            vec!["[Panel]"]
+        );
     }
 
     #[test]
     fn extract_tags_finds_multiple_tokens_in_order() {
-        assert_eq!(extract_tags("[Carcass] Left / [Panel] Bottom"), vec!["[Carcass]", "[Panel]"]);
+        assert_eq!(
+            extract_tags("[Carcass] Left / [Panel] Bottom"),
+            vec!["[Carcass]", "[Panel]"]
+        );
     }
 
     #[test]
@@ -60,7 +72,10 @@ mod tests {
 
     #[test]
     fn extract_tags_keeps_duplicates_within_one_path() {
-        assert_eq!(extract_tags("[Panel] Left / [Panel] Right"), vec!["[Panel]", "[Panel]"]);
+        assert_eq!(
+            extract_tags("[Panel] Left / [Panel] Right"),
+            vec!["[Panel]", "[Panel]"]
+        );
     }
 
     #[test]
@@ -71,14 +86,23 @@ mod tests {
     #[test]
     fn classify_by_keyword_returns_the_first_matching_rule() {
         let rules = [("Carcass", "Carcasses"), ("Door", "Doors")];
-        assert_eq!(classify_by_keyword("Bench / Left Carcass / Bottom", &rules), Some("Carcasses".to_string()));
-        assert_eq!(classify_by_keyword("Bench / Left Door / Panel", &rules), Some("Doors".to_string()));
+        assert_eq!(
+            classify_by_keyword("Bench / Left Carcass / Bottom", &rules),
+            Some("Carcasses".to_string())
+        );
+        assert_eq!(
+            classify_by_keyword("Bench / Left Door / Panel", &rules),
+            Some("Doors".to_string())
+        );
     }
 
     #[test]
     fn classify_by_keyword_returns_none_when_nothing_matches() {
         let rules = [("Carcass", "Carcasses"), ("Door", "Doors")];
-        assert_eq!(classify_by_keyword("Bench / Face Frame / Rail", &rules), None);
+        assert_eq!(
+            classify_by_keyword("Bench / Face Frame / Rail", &rules),
+            None
+        );
     }
 
     #[test]
@@ -86,6 +110,9 @@ mod tests {
         // A path matching more than one rule's keyword picks whichever
         // rule was listed first -- never both, never the "better" match.
         let rules = [("Face Frame", "Face Frames"), ("Frame", "Frames")];
-        assert_eq!(classify_by_keyword("Bench / Face Frame Rail", &rules), Some("Face Frames".to_string()));
+        assert_eq!(
+            classify_by_keyword("Bench / Face Frame Rail", &rules),
+            Some("Face Frames".to_string())
+        );
     }
 }

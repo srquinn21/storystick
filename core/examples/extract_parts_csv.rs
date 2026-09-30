@@ -8,8 +8,13 @@ fn leaf(path: &str) -> &str {
 }
 
 fn main() {
-    let step_path = PathBuf::from(std::env::args().nth(1).expect("usage: extract_parts_csv <step-file>"));
-    let groups = storystick_core::stepcrawl::extract_parts(&step_path).expect("failed to parse STEP file");
+    let step_path = PathBuf::from(
+        std::env::args()
+            .nth(1)
+            .expect("usage: extract_parts_csv <step-file>"),
+    );
+    let groups =
+        storystick_core::stepcrawl::extract_parts(&step_path).expect("failed to parse STEP file");
 
     println!("top_folder,label,path,length_in,width_in,thickness_in,unreliable");
     for group in &groups {

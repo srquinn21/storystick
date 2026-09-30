@@ -37,10 +37,22 @@ mod tests {
 
     #[test]
     fn classifies_each_known_construction_stage() {
-        assert_eq!(classify("Bench / Left Carcass / Bottom"), Some("Carcasses".to_string()));
-        assert_eq!(classify("Bench / Left Door / Panel"), Some("Doors".to_string()));
-        assert_eq!(classify("Bench / Face Frame / Rail"), Some("Face Frames".to_string()));
-        assert_eq!(classify("Bench / Top Drawer / Front"), Some("Drawers".to_string()));
+        assert_eq!(
+            classify("Bench / Left Carcass / Bottom"),
+            Some("Carcasses".to_string())
+        );
+        assert_eq!(
+            classify("Bench / Left Door / Panel"),
+            Some("Doors".to_string())
+        );
+        assert_eq!(
+            classify("Bench / Face Frame / Rail"),
+            Some("Face Frames".to_string())
+        );
+        assert_eq!(
+            classify("Bench / Top Drawer / Front"),
+            Some("Drawers".to_string())
+        );
     }
 
     #[test]

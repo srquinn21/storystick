@@ -110,7 +110,14 @@ pub struct PackablePart {
 
 impl PackablePart {
     pub fn new(label: impl Into<String>, length_mm: f64, width_mm: f64, thickness_mm: f64) -> Self {
-        Self { label: label.into(), length_mm, width_mm, thickness_mm, qty: 1, material_name: None }
+        Self {
+            label: label.into(),
+            length_mm,
+            width_mm,
+            thickness_mm,
+            qty: 1,
+            material_name: None,
+        }
     }
 }
 
@@ -230,7 +237,7 @@ fn best_fit_free_rect(free_rects: &[FreeRect], length: f64, width: f64) -> Optio
     for (i, &(_x, _y, fw, fh)) in free_rects.iter().enumerate() {
         if length <= fw && width <= fh {
             let area = fw * fh;
-            if best.map_or(true, |(a, _)| area < a) {
+            if best.is_none_or(|(a, _)| area < a) {
                 best = Some((area, i));
             }
         }
@@ -245,7 +252,12 @@ fn best_fit_free_rect(free_rects: &[FreeRect], length: f64, width: f64) -> Optio
 /// own free rect). Safe in either split orientation -- this free rect
 /// already belongs to an isolated strip, never the original full sheet.
 /// Returns the piece's placement origin (x, y).
-fn split_free_rect(free_rects: &mut Vec<FreeRect>, index: usize, length: f64, width: f64) -> (f64, f64) {
+fn split_free_rect(
+    free_rects: &mut Vec<FreeRect>,
+    index: usize,
+    length: f64,
+    width: f64,
+) -> (f64, f64) {
     let (fx, fy, fw, fh) = free_rects.remove(index);
     let right_w = fw - length;
     let top_h = fh - width;
@@ -323,10 +335,17 @@ fn place_on_candidate(
         let (si, ti, fi) = match found {
             Some(t) => t,
             None => {
-                let si = match sheets.iter().position(|s| s.used_width_mm + width <= candidate.width_mm) {
+                let si = match sheets
+                    .iter()
+                    .position(|s| s.used_width_mm + width <= candidate.width_mm)
+                {
                     Some(i) => i,
                     None => {
-                        sheets.push(SheetInProgress { sheet_index: sheets.len(), used_width_mm: 0.0, strips: Vec::new() });
+                        sheets.push(SheetInProgress {
+                            sheet_index: sheets.len(),
+                            used_width_mm: 0.0,
+                            strips: Vec::new(),
+                        });
                         sheets.len() - 1
                     }
                 };
@@ -375,7 +394,12 @@ enum Bucket {
 /// finishing pass (see `crate::diagrams`). Reported Placement sizes are
 /// always the true final dimensions, never the inflated packing
 /// footprint.
-pub fn pack(parts: &[PackablePart], stock: &[StockSheet], kerf_mm: f64, trim_allowance_mm: f64) -> Layout {
+pub fn pack(
+    parts: &[PackablePart],
+    stock: &[StockSheet],
+    kerf_mm: f64,
+    trim_allowance_mm: f64,
+) -> Layout {
     let allowance_mm = kerf_mm + trim_allowance_mm;
 
     let mut pieces_by_bucket: HashMap<Bucket, Vec<(usize, PackablePart)>> = HashMap::new();
@@ -405,9 +429,16 @@ pub fn pack(parts: &[PackablePart], stock: &[StockSheet], kerf_mm: f64, trim_all
         let pieces = &pieces_by_bucket[bucket];
         let mut candidates: Vec<&StockSheet> = match bucket {
             Bucket::Material(name) => stock.iter().filter(|s| &s.material.name == name).collect(),
-            Bucket::Thickness(bits) => stock.iter().filter(|s| s.thickness_mm().to_bits() == *bits).collect(),
+            Bucket::Thickness(bits) => stock
+                .iter()
+                .filter(|s| s.thickness_mm().to_bits() == *bits)
+                .collect(),
         };
-        candidates.sort_by(|a, b| (b.length_mm * b.width_mm).partial_cmp(&(a.length_mm * a.width_mm)).unwrap());
+        candidates.sort_by(|a, b| {
+            (b.length_mm * b.width_mm)
+                .partial_cmp(&(a.length_mm * a.width_mm))
+                .unwrap()
+        });
 
         let mut remaining: Vec<(usize, PackablePart)> = pieces.clone();
         for &candidate in &candidates {
@@ -416,17 +447,25 @@ pub fn pack(parts: &[PackablePart], stock: &[StockSheet], kerf_mm: f64, trim_all
             }
             let (in_progress, placed_ids) = place_on_candidate(&remaining, candidate, allowance_mm);
             for sheet in in_progress {
-                let placements: Vec<Placement> = sheet.strips.into_iter().flat_map(|s| s.placements).collect();
+                let placements: Vec<Placement> = sheet
+                    .strips
+                    .into_iter()
+                    .flat_map(|s| s.placements)
+                    .collect();
                 if placements.is_empty() {
                     continue;
                 }
                 let idx = *next_sheet_index.get(candidate).unwrap_or(&0);
                 next_sheet_index.insert(candidate.clone(), idx + 1);
-                sheets.push(SheetLayout { stock: candidate.clone(), sheet_index: idx, placements });
+                sheets.push(SheetLayout {
+                    stock: candidate.clone(),
+                    sheet_index: idx,
+                    placements,
+                });
             }
 
             let placed_set: HashSet<usize> = placed_ids.into_iter().collect();
-            remaining = remaining.into_iter().filter(|(id, _)| !placed_set.contains(id)).collect();
+            remaining.retain(|(id, _)| !placed_set.contains(id));
         }
 
         unplaced.extend(remaining.into_iter().map(|(_, part)| part));
@@ -465,11 +504,12 @@ pub fn bill_of_materials<'a>(sheets: impl IntoIterator<Item = &'a SheetLayout>) 
         })
         .collect();
     lines.sort_by(|a, b| {
-        a.stock
-            .material
-            .name
-            .cmp(&b.stock.material.name)
-            .then(a.stock.thickness_mm().partial_cmp(&b.stock.thickness_mm()).unwrap())
+        a.stock.material.name.cmp(&b.stock.material.name).then(
+            a.stock
+                .thickness_mm()
+                .partial_cmp(&b.stock.thickness_mm())
+                .unwrap(),
+        )
     });
     lines
 }
@@ -479,15 +519,29 @@ mod tests {
     use super::*;
 
     fn three_quarter() -> Material {
-        Material { name: "3/4 Baltic Birch".to_string(), thickness_mm: 19.05 }
+        Material {
+            name: "3/4 Baltic Birch".to_string(),
+            thickness_mm: 19.05,
+        }
     }
     fn quarter() -> Material {
-        Material { name: "1/4 Baltic Birch".to_string(), thickness_mm: 6.35 }
+        Material {
+            name: "1/4 Baltic Birch".to_string(),
+            thickness_mm: 6.35,
+        }
     }
     fn stock() -> Vec<StockSheet> {
         vec![
-            StockSheet { material: three_quarter(), length_mm: 2438.4, width_mm: 1219.2 },
-            StockSheet { material: quarter(), length_mm: 2438.4, width_mm: 1219.2 },
+            StockSheet {
+                material: three_quarter(),
+                length_mm: 2438.4,
+                width_mm: 1219.2,
+            },
+            StockSheet {
+                material: quarter(),
+                length_mm: 2438.4,
+                width_mm: 1219.2,
+            },
         ]
     }
 
@@ -503,8 +557,16 @@ mod tests {
         // own.
         let sheet = &stock()[0];
         let rotated_would_fit = PackablePart::new("panel", 1300.0, 800.0, 19.05);
-        assert!(pack(&[rotated_would_fit], &stock(), DEFAULT_KERF_MM, 0.0).unplaced.is_empty(), "sanity: the swapped footprint does fit");
-        assert!(1300.0 > sheet.width_mm, "test assumption: as-given width alone shouldn't fit");
+        assert!(
+            pack(&[rotated_would_fit], &stock(), DEFAULT_KERF_MM, 0.0)
+                .unplaced
+                .is_empty(),
+            "sanity: the swapped footprint does fit"
+        );
+        assert!(
+            1300.0 > sheet.width_mm,
+            "test assumption: as-given width alone shouldn't fit"
+        );
 
         let as_given = PackablePart::new("panel", 800.0, 1300.0, 19.05);
         let layout = pack(&[as_given], &stock(), DEFAULT_KERF_MM, 0.0);
@@ -515,20 +577,37 @@ mod tests {
     #[test]
     fn pack_buckets_by_thickness_not_just_size() {
         let parts = vec![
-            PackablePart { qty: 2, ..PackablePart::new("panel", 765.175, 406.4, 19.05) },
+            PackablePart {
+                qty: 2,
+                ..PackablePart::new("panel", 765.175, 406.4, 19.05)
+            },
             PackablePart::new("backer", 787.4, 431.8, 6.35),
         ];
         let layout = pack(&parts, &stock(), DEFAULT_KERF_MM, 0.0);
 
         assert!(layout.unplaced.is_empty());
-        let thicknesses: HashSet<u64> = layout.sheets.iter().map(|s| s.stock.thickness_mm().to_bits()).collect();
-        assert_eq!(thicknesses, [19.05f64.to_bits(), 6.35f64.to_bits()].into_iter().collect());
+        let thicknesses: HashSet<u64> = layout
+            .sheets
+            .iter()
+            .map(|s| s.stock.thickness_mm().to_bits())
+            .collect();
+        assert_eq!(
+            thicknesses,
+            [19.05f64.to_bits(), 6.35f64.to_bits()]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]
     fn pack_reports_unplaced_when_no_matching_stock() {
         let orphan = PackablePart::new("mystery", 500.0, 300.0, 12.7);
-        let layout = pack(&[orphan.clone()], &stock(), DEFAULT_KERF_MM, 0.0);
+        let layout = pack(
+            std::slice::from_ref(&orphan),
+            &stock(),
+            DEFAULT_KERF_MM,
+            0.0,
+        );
 
         assert_eq!(layout.unplaced, vec![orphan]);
         assert!(layout.sheets.is_empty());
@@ -537,43 +616,78 @@ mod tests {
     #[test]
     fn bill_of_materials_counts_sheets_per_stock_item() {
         let parts = vec![
-            PackablePart { qty: 2, ..PackablePart::new("panel", 765.175, 406.4, 19.05) },
+            PackablePart {
+                qty: 2,
+                ..PackablePart::new("panel", 765.175, 406.4, 19.05)
+            },
             PackablePart::new("backer", 787.4, 431.8, 6.35),
         ];
         let layout = pack(&parts, &stock(), DEFAULT_KERF_MM, 0.0);
         let bom = bill_of_materials(&layout.sheets);
 
-        let by_name: HashMap<&str, usize> = bom.iter().map(|l| (l.stock.material.name.as_str(), l.qty)).collect();
-        assert_eq!(by_name["3/4 Baltic Birch"], 1, "both 30x16in pieces fit one 96x48in sheet with real packing");
+        let by_name: HashMap<&str, usize> = bom
+            .iter()
+            .map(|l| (l.stock.material.name.as_str(), l.qty))
+            .collect();
+        assert_eq!(
+            by_name["3/4 Baltic Birch"], 1,
+            "both 30x16in pieces fit one 96x48in sheet with real packing"
+        );
         assert_eq!(by_name["1/4 Baltic Birch"], 1);
-        assert_eq!(bom.iter().map(|l| l.qty).sum::<usize>(), layout.sheets.len());
+        assert_eq!(
+            bom.iter().map(|l| l.qty).sum::<usize>(),
+            layout.sheets.len()
+        );
     }
 
     #[test]
     fn pack_places_multiple_parts_per_sheet_without_overlap() {
-        let parts: Vec<PackablePart> = (0..4).map(|i| PackablePart::new(format!("panel-{i}"), 762.0, 406.4, 19.05)).collect();
+        let parts: Vec<PackablePart> = (0..4)
+            .map(|i| PackablePart::new(format!("panel-{i}"), 762.0, 406.4, 19.05))
+            .collect();
         let layout = pack(&parts, &stock(), DEFAULT_KERF_MM, 0.0);
 
         assert!(layout.unplaced.is_empty());
-        assert_eq!(layout.sheets.len(), 1, "four 30x16in panels should nest onto a single 96x48in sheet");
+        assert_eq!(
+            layout.sheets.len(),
+            1,
+            "four 30x16in panels should nest onto a single 96x48in sheet"
+        );
         let placements = &layout.sheets[0].placements;
         assert_eq!(placements.len(), 4);
         for (i, a) in placements.iter().enumerate() {
             for b in &placements[i + 1..] {
                 let x_overlap = a.x_mm < b.x_mm + b.length_mm && b.x_mm < a.x_mm + a.length_mm;
                 let y_overlap = a.y_mm < b.y_mm + b.width_mm && b.y_mm < a.y_mm + a.width_mm;
-                assert!(!(x_overlap && y_overlap), "placements overlap: {a:?} vs {b:?}");
+                assert!(
+                    !(x_overlap && y_overlap),
+                    "placements overlap: {a:?} vs {b:?}"
+                );
             }
         }
     }
 
     #[test]
     fn material_name_pins_a_part_even_at_shared_thickness() {
-        let finished = Material { name: "Baltic Birch 3/4 (finished)".to_string(), thickness_mm: 19.05 };
-        let utility = Material { name: "Sande Ply 3/4 (utility)".to_string(), thickness_mm: 19.05 };
+        let finished = Material {
+            name: "Baltic Birch 3/4 (finished)".to_string(),
+            thickness_mm: 19.05,
+        };
+        let utility = Material {
+            name: "Sande Ply 3/4 (utility)".to_string(),
+            thickness_mm: 19.05,
+        };
         let stock = vec![
-            StockSheet { material: finished.clone(), length_mm: 2438.4, width_mm: 1219.2 },
-            StockSheet { material: utility.clone(), length_mm: 2438.4, width_mm: 1219.2 },
+            StockSheet {
+                material: finished.clone(),
+                length_mm: 2438.4,
+                width_mm: 1219.2,
+            },
+            StockSheet {
+                material: utility.clone(),
+                length_mm: 2438.4,
+                width_mm: 1219.2,
+            },
         ];
         let panel = PackablePart {
             material_name: Some(finished.name.clone()),
@@ -587,10 +701,23 @@ mod tests {
         let layout = pack(&[panel, stretcher], &stock, DEFAULT_KERF_MM, 0.0);
 
         assert!(layout.unplaced.is_empty());
-        let materials_used: HashSet<&str> = layout.sheets.iter().map(|s| s.stock.material.name.as_str()).collect();
-        assert_eq!(materials_used, [finished.name.as_str(), utility.name.as_str()].into_iter().collect());
+        let materials_used: HashSet<&str> = layout
+            .sheets
+            .iter()
+            .map(|s| s.stock.material.name.as_str())
+            .collect();
+        assert_eq!(
+            materials_used,
+            [finished.name.as_str(), utility.name.as_str()]
+                .into_iter()
+                .collect()
+        );
         for sheet in &layout.sheets {
-            let labels: HashSet<&str> = sheet.placements.iter().map(|p| p.part_label.as_str()).collect();
+            let labels: HashSet<&str> = sheet
+                .placements
+                .iter()
+                .map(|p| p.part_label.as_str())
+                .collect();
             if sheet.stock.material.name == finished.name {
                 assert_eq!(labels, ["show-face panel"].into_iter().collect());
             } else {
@@ -617,13 +744,24 @@ mod tests {
         let strip = &sheets[0].strips[0];
         assert_eq!(strip.free_rects.len(), 1);
         let (fx, _fy, fw, fh) = strip.free_rects[0];
-        assert_eq!(fx + fw, stock()[0].length_mm, "leftover after one placement should reach exactly the sheet's full length");
+        assert_eq!(
+            fx + fw,
+            stock()[0].length_mm,
+            "leftover after one placement should reach exactly the sheet's full length"
+        );
         assert_eq!(fh, 600.0, "leftover should keep the strip's full height available, not just the placed part's row");
     }
 
     #[test]
     fn short_part_reuses_leftover_height_within_a_strip() {
-        let test_stock = StockSheet { material: Material { name: "test".to_string(), thickness_mm: 19.0 }, length_mm: 1000.0, width_mm: 500.0 };
+        let test_stock = StockSheet {
+            material: Material {
+                name: "test".to_string(),
+                thickness_mm: 19.0,
+            },
+            length_mm: 1000.0,
+            width_mm: 500.0,
+        };
         let parts = vec![
             (0usize, PackablePart::new("tall", 200.0, 300.0, 19.0)),
             (1usize, PackablePart::new("medium", 300.0, 120.0, 19.0)),
@@ -634,11 +772,21 @@ mod tests {
 
         assert_eq!(placed_ids.len(), 3);
         assert_eq!(sheets.len(), 1);
-        assert_eq!(sheets[0].strips.len(), 1, "medium and short should both reuse tall's strip, not open new ones");
-        let by_label: HashMap<&str, &Placement> =
-            sheets[0].strips[0].placements.iter().map(|p| (p.part_label.as_str(), p)).collect();
+        assert_eq!(
+            sheets[0].strips.len(),
+            1,
+            "medium and short should both reuse tall's strip, not open new ones"
+        );
+        let by_label: HashMap<&str, &Placement> = sheets[0].strips[0]
+            .placements
+            .iter()
+            .map(|p| (p.part_label.as_str(), p))
+            .collect();
         assert_eq!(by_label["medium"].y_mm, 0.0);
-        assert_eq!(by_label["short"].y_mm, by_label["medium"].width_mm, "short should stack directly above medium");
+        assert_eq!(
+            by_label["short"].y_mm, by_label["medium"].width_mm,
+            "short should stack directly above medium"
+        );
     }
 
     #[test]
@@ -655,7 +803,14 @@ mod tests {
         // can cost a whole extra sheet -- so this only asserts none of
         // that: every part placed, and no more sheets used than pieces
         // that can't share space at all actually require.
-        let test_stock = StockSheet { material: Material { name: "test".to_string(), thickness_mm: 19.0 }, length_mm: 960.0, width_mm: 480.0 };
+        let test_stock = StockSheet {
+            material: Material {
+                name: "test".to_string(),
+                thickness_mm: 19.0,
+            },
+            length_mm: 960.0,
+            width_mm: 480.0,
+        };
         let parts = vec![
             (0usize, PackablePart::new("wide-a", 331.25, 290.0, 19.0)),
             (1usize, PackablePart::new("wide-b", 331.25, 290.0, 19.0)),
@@ -669,12 +824,20 @@ mod tests {
         let (sheets, placed_ids) = place_on_candidate(&parts, &test_stock, 0.0);
 
         assert_eq!(placed_ids.len(), 7);
-        let short_placements: usize =
-            sheets.iter().flat_map(|s| &s.strips).flat_map(|strip| &strip.placements).filter(|p| p.part_label.starts_with("short-")).count();
+        let short_placements: usize = sheets
+            .iter()
+            .flat_map(|s| &s.strips)
+            .flat_map(|strip| &strip.placements)
+            .filter(|p| p.part_label.starts_with("short-"))
+            .count();
         assert_eq!(short_placements, 3);
         // 2 sheets already exist (wide's and mid's) by the time the short
         // group is placed; all three short parts fit into leftover space
         // on those two, so no third sheet should ever open.
-        assert_eq!(sheets.len(), 2, "the short group should reuse the two sheets already open, not strand a third");
+        assert_eq!(
+            sheets.len(),
+            2,
+            "the short group should reuse the two sheets already open, not strand a third"
+        );
     }
 }

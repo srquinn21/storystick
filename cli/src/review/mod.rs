@@ -157,12 +157,20 @@ fn assignment_key(path: &str, length_in: f64, width_in: f64, thickness_in: f64) 
 /// each time means a cleared material or an untoggled swap recovers
 /// exactly the original guess, and a changed material re-picks thickness
 /// fresh rather than compounding onto a previous correction.
-fn resolve_dims(raw: (f64, f64, f64), material: Option<&Material>, swapped: bool) -> (f64, f64, f64, bool) {
+fn resolve_dims(
+    raw: (f64, f64, f64),
+    material: Option<&Material>,
+    swapped: bool,
+) -> (f64, f64, f64, bool) {
     let (mut length_in, mut width_in, mut thickness_in) = raw;
     let mut thickness_mismatch = false;
     if let Some(m) = material {
         let raw_mm = (raw.0 * MM_PER_IN, raw.1 * MM_PER_IN, raw.2 * MM_PER_IN);
-        match relabel_with_known_thickness(raw_mm, m.thickness_mm, COMPATIBLE_THICKNESS_TOLERANCE_IN * MM_PER_IN) {
+        match relabel_with_known_thickness(
+            raw_mm,
+            m.thickness_mm,
+            COMPATIBLE_THICKNESS_TOLERANCE_IN * MM_PER_IN,
+        ) {
             Ok((length_mm, width_mm, thickness_mm)) => {
                 length_in = round4(length_mm / MM_PER_IN);
                 width_in = round4(width_mm / MM_PER_IN);
@@ -183,19 +191,33 @@ fn resolve_dims(raw: (f64, f64, f64), material: Option<&Material>, swapped: bool
 fn format_editable(v: f64) -> String {
     let s = format!("{v:.4}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
-    if s.is_empty() { "0".to_string() } else { s.to_string() }
+    if s.is_empty() {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 impl Part {
     fn to_packable(&self) -> PackablePart {
-        let mut part = PackablePart::new(self.path.clone(), self.length_in * MM_PER_IN, self.width_in * MM_PER_IN, self.thickness_in * MM_PER_IN);
+        let mut part = PackablePart::new(
+            self.path.clone(),
+            self.length_in * MM_PER_IN,
+            self.width_in * MM_PER_IN,
+            self.thickness_in * MM_PER_IN,
+        );
         part.material_name = self.material.as_ref().map(|m| m.name.clone());
         part
     }
 }
 
-fn compatible_materials<'a>(materials: &'a [Material], thickness_in: f64) -> Vec<&'a Material> {
-    materials.iter().filter(|m| (m.thickness_mm / MM_PER_IN - thickness_in).abs() <= COMPATIBLE_THICKNESS_TOLERANCE_IN).collect()
+fn compatible_materials(materials: &[Material], thickness_in: f64) -> Vec<&Material> {
+    materials
+        .iter()
+        .filter(|m| {
+            (m.thickness_mm / MM_PER_IN - thickness_in).abs() <= COMPATIBLE_THICKNESS_TOLERANCE_IN
+        })
+        .collect()
 }
 
 /// Looks up a material by name against `materials` -- this project's own
@@ -206,7 +228,12 @@ fn compatible_materials<'a>(materials: &'a [Material], thickness_in: f64) -> Vec
 /// `materials`' own names, so a miss here would mean that check was
 /// skipped, not a normal, recoverable user error.
 fn find_material<'a>(materials: &'a [Material], name: &str) -> &'a Material {
-    materials.iter().find(|m| m.name == name).unwrap_or_else(|| panic!("material {name:?} not found -- was Project::validate_references skipped?"))
+    materials
+        .iter()
+        .find(|m| m.name == name)
+        .unwrap_or_else(|| {
+            panic!("material {name:?} not found -- was Project::validate_references skipped?")
+        })
 }
 
 /// Every distinct bracket tag across `parts`' paths, with how many parts
@@ -229,7 +256,13 @@ fn distinct_tags(parts: &[Part]) -> Vec<(String, usize)> {
             }
         }
     }
-    order.into_iter().map(|tag| { let count = counts[&tag]; (tag, count) }).collect()
+    order
+        .into_iter()
+        .map(|tag| {
+            let count = counts[&tag];
+            (tag, count)
+        })
+        .collect()
 }
 
 /// A part's material, given whether it has its own `exception` (from
@@ -246,7 +279,11 @@ fn distinct_tags(parts: &[Part]) -> Vec<(String, usize)> {
 /// summary, so a future part that turns out a bad fit for it should
 /// surface via `thickness_mismatch` (a real signal worth seeing), not be
 /// silently suppressed the way an unreviewed guess would need to be.
-fn resolve_material(path: &str, exception: Option<String>, autofill_map: &std::collections::BTreeMap<String, String>) -> (Option<String>, bool) {
+fn resolve_material(
+    path: &str,
+    exception: Option<String>,
+    autofill_map: &std::collections::BTreeMap<String, String>,
+) -> (Option<String>, bool) {
     match exception {
         Some(name) => (Some(name), true),
         None => (autofill::guess_material(path, autofill_map), false),
@@ -261,13 +298,18 @@ fn resolve_material(path: &str, exception: Option<String>, autofill_map: &std::c
 /// whatever a rule says, including a rule that changes after the
 /// exception was set. Returns the indices actually changed so the caller
 /// can re-derive each one's dims (`App::resolve_part_dims`).
-fn apply_bulk_material(parts: &mut [Part], autofill_map: &std::collections::BTreeMap<String, String>, materials: &[Material]) -> Vec<usize> {
+fn apply_bulk_material(
+    parts: &mut [Part],
+    autofill_map: &std::collections::BTreeMap<String, String>,
+    materials: &[Material],
+) -> Vec<usize> {
     let mut changed = Vec::new();
     for (i, part) in parts.iter_mut().enumerate() {
         if part.is_exception {
             continue;
         }
-        let resolved = autofill::guess_material(&part.path, autofill_map).map(|name| find_material(materials, &name).clone());
+        let resolved = autofill::guess_material(&part.path, autofill_map)
+            .map(|name| find_material(materials, &name).clone());
         if part.material != resolved {
             part.material = resolved;
             changed.push(i);
@@ -302,12 +344,22 @@ pub(crate) fn part_flag(part: &Part, materials: &[Material]) -> Option<&'static 
         return Some("material thickness doesn't match this part's geometry");
     }
     if part.material.is_none() {
-        return Some(if compatible_materials(materials, part.thickness_in).len() > 1 { "ambiguous material" } else { "no material assigned" });
+        return Some(
+            if compatible_materials(materials, part.thickness_in).len() > 1 {
+                "ambiguous material"
+            } else {
+                "no material assigned"
+            },
+        );
     }
     None
 }
 
-fn load_parts(step_path: &Path, project: &Project, materials: &[Material]) -> Result<Vec<Part>, Box<dyn Error>> {
+fn load_parts(
+    step_path: &Path,
+    project: &Project,
+    materials: &[Material],
+) -> Result<Vec<Part>, Box<dyn Error>> {
     let groups = extract_parts(step_path)?;
     let mut parts = Vec::new();
     for group in &groups {
@@ -315,14 +367,23 @@ fn load_parts(step_path: &Path, project: &Project, materials: &[Material]) -> Re
             let raw_length_in = round4(group.length_mm / MM_PER_IN);
             let raw_width_in = round4(group.width_mm / MM_PER_IN);
             let raw_thickness_in = round4(group.thickness_mm / MM_PER_IN);
-            let key = assignment_key(&instance.path, raw_length_in, raw_width_in, raw_thickness_in);
+            let key = assignment_key(
+                &instance.path,
+                raw_length_in,
+                raw_width_in,
+                raw_thickness_in,
+            );
             let over = project.assignments.get(&key);
             let exception = over.and_then(|o| o.material.clone());
-            let (material_name, is_exception) = resolve_material(&instance.path, exception, &project.autofill);
+            let (material_name, is_exception) =
+                resolve_material(&instance.path, exception, &project.autofill);
             let swapped = over.map(|o| o.swapped).unwrap_or(false);
             let material = material_name.map(|name| find_material(materials, &name).clone());
-            let (length_in, width_in, thickness_in, thickness_mismatch) =
-                resolve_dims((raw_length_in, raw_width_in, raw_thickness_in), material.as_ref(), swapped);
+            let (length_in, width_in, thickness_in, thickness_mismatch) = resolve_dims(
+                (raw_length_in, raw_width_in, raw_thickness_in),
+                material.as_ref(),
+                swapped,
+            );
             parts.push(Part {
                 path: instance.path.clone(),
                 assignment_key: key,
@@ -368,7 +429,10 @@ pub(crate) struct PickerState {
 /// confirming that picker lands back on this same tag list with its
 /// material column refreshed (see `confirm_picker`).
 pub(crate) enum BulkState {
-    PickTag { tags: Vec<(String, usize, Option<String>)>, list_state: ListState },
+    PickTag {
+        tags: Vec<(String, usize, Option<String>)>,
+        list_state: ListState,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -446,7 +510,10 @@ impl App {
     /// would stick until the next keypress instead of timing out on its
     /// own.
     fn expire_status(&mut self) {
-        if self.status_message_at.is_some_and(|at| at.elapsed() >= STATUS_MESSAGE_TIMEOUT) {
+        if self
+            .status_message_at
+            .is_some_and(|at| at.elapsed() >= STATUS_MESSAGE_TIMEOUT)
+        {
             self.status = self.default_status.clone();
             self.status_message_at = None;
         }
@@ -468,7 +535,11 @@ impl App {
     /// red-flagged row remains in the tree, which is the one thing this
     /// count exists to rule out.
     pub(crate) fn resolved_counts(&self) -> (usize, usize) {
-        let resolved = self.parts.iter().filter(|p| p.material.is_some() && part_flag(p, &self.materials).is_none()).count();
+        let resolved = self
+            .parts
+            .iter()
+            .filter(|p| p.material.is_some() && part_flag(p, &self.materials).is_none())
+            .count();
         (resolved, self.parts.len())
     }
 
@@ -500,7 +571,10 @@ impl App {
             return;
         };
         let part = &self.parts[i];
-        let mut options: Vec<String> = compatible_materials(&self.materials, part.thickness_in).into_iter().map(|m| m.name.clone()).collect();
+        let mut options: Vec<String> = compatible_materials(&self.materials, part.thickness_in)
+            .into_iter()
+            .map(|m| m.name.clone())
+            .collect();
         options.sort();
         options.insert(0, "(clear -- match by thickness alone)".to_string());
         let current_index = match &part.material {
@@ -509,7 +583,11 @@ impl App {
         };
         let mut list_state = ListState::default();
         list_state.select(Some(current_index));
-        self.picker = Some(PickerState { target: PickerTarget::Part(i), options, list_state });
+        self.picker = Some(PickerState {
+            target: PickerTarget::Part(i),
+            options,
+            list_state,
+        });
     }
 
     /// Opens bulk-edit's tag list (see `BulkState`), or reports there's
@@ -522,7 +600,13 @@ impl App {
             self.set_status("no bracket-tagged parts to bulk-edit");
             return;
         }
-        let tags = tags.into_iter().map(|(tag, count)| { let material = self.project.autofill.get(&tag).cloned(); (tag, count, material) }).collect();
+        let tags = tags
+            .into_iter()
+            .map(|(tag, count)| {
+                let material = self.project.autofill.get(&tag).cloned();
+                (tag, count, material)
+            })
+            .collect();
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         self.bulk = Some(BulkState::PickTag { tags, list_state });
@@ -534,8 +618,12 @@ impl App {
     /// `confirm_picker`). `self.bulk` is deliberately left in place --
     /// cancelling or confirming the picker returns to this same tag list.
     fn bulk_pick_tag(&mut self) {
-        let Some(BulkState::PickTag { tags, list_state }) = &self.bulk else { return };
-        let Some(i) = list_state.selected() else { return };
+        let Some(BulkState::PickTag { tags, list_state }) = &self.bulk else {
+            return;
+        };
+        let Some(i) = list_state.selected() else {
+            return;
+        };
         let tag = tags[i].0.clone();
         let mut options: Vec<String> = self.materials.iter().map(|m| m.name.clone()).collect();
         options.sort();
@@ -546,7 +634,11 @@ impl App {
         };
         let mut list_state = ListState::default();
         list_state.select(Some(current_index));
-        self.picker = Some(PickerState { target: PickerTarget::Tag(tag), options, list_state });
+        self.picker = Some(PickerState {
+            target: PickerTarget::Tag(tag),
+            options,
+            list_state,
+        });
     }
 
     /// Recomputes `length_in`/`width_in`/`thickness_in`/`thickness_mismatch`
@@ -554,9 +646,14 @@ impl App {
     /// state -- call after mutating either (see `resolve_dims`).
     fn resolve_part_dims(&mut self, i: usize) {
         let material = self.parts[i].material.clone();
-        let raw = (self.parts[i].raw_length_in, self.parts[i].raw_width_in, self.parts[i].raw_thickness_in);
+        let raw = (
+            self.parts[i].raw_length_in,
+            self.parts[i].raw_width_in,
+            self.parts[i].raw_thickness_in,
+        );
         let swapped = self.parts[i].swapped;
-        let (length_in, width_in, thickness_in, thickness_mismatch) = resolve_dims(raw, material.as_ref(), swapped);
+        let (length_in, width_in, thickness_in, thickness_mismatch) =
+            resolve_dims(raw, material.as_ref(), swapped);
         let part = &mut self.parts[i];
         part.length_in = length_in;
         part.width_in = width_in;
@@ -565,14 +662,23 @@ impl App {
     }
 
     fn confirm_picker(&mut self) {
-        let Some(picker) = self.picker.take() else { return };
-        let Some(choice) = picker.list_state.selected() else { return };
-        let chosen = if choice == 0 { None } else { Some(picker.options[choice].clone()) };
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        let Some(choice) = picker.list_state.selected() else {
+            return;
+        };
+        let chosen = if choice == 0 {
+            None
+        } else {
+            Some(picker.options[choice].clone())
+        };
         match picker.target {
             PickerTarget::Part(i) => {
                 match chosen {
                     Some(name) => {
-                        self.parts[i].material = Some(find_material(&self.materials, &name).clone());
+                        self.parts[i].material =
+                            Some(find_material(&self.materials, &name).clone());
                         self.parts[i].is_exception = true;
                     }
                     None => {
@@ -582,7 +688,8 @@ impl App {
                         // material" exception.
                         self.parts[i].is_exception = false;
                         self.parts[i].material =
-                            autofill::guess_material(&self.parts[i].path, &self.project.autofill).map(|name| find_material(&self.materials, &name).clone());
+                            autofill::guess_material(&self.parts[i].path, &self.project.autofill)
+                                .map(|name| find_material(&self.materials, &name).clone());
                     }
                 }
                 self.resolve_part_dims(i);
@@ -598,7 +705,8 @@ impl App {
                         self.project.autofill.remove(&tag);
                     }
                 }
-                let changed = apply_bulk_material(&mut self.parts, &self.project.autofill, &self.materials);
+                let changed =
+                    apply_bulk_material(&mut self.parts, &self.project.autofill, &self.materials);
                 for i in &changed {
                     self.resolve_part_dims(*i);
                 }
@@ -608,7 +716,10 @@ impl App {
                     }
                 }
                 self.dirty = true;
-                self.set_status(format!("updated the {tag} rule -- {} part(s) changed", changed.len()));
+                self.set_status(format!(
+                    "updated the {tag} rule -- {} part(s) changed",
+                    changed.len()
+                ));
             }
         }
     }
@@ -632,9 +743,20 @@ impl App {
                 // A rule-derived material is never frozen into an
                 // exception -- only `is_exception` (an explicit per-part
                 // override) persists. See `Part::is_exception`.
-                let material = if p.is_exception { p.material.as_ref().map(|m| m.name.clone()) } else { None };
-                let over = PartOverride { material, swapped: p.swapped };
-                if over.is_empty() { None } else { Some((p.assignment_key.clone(), over)) }
+                let material = if p.is_exception {
+                    p.material.as_ref().map(|m| m.name.clone())
+                } else {
+                    None
+                };
+                let over = PartOverride {
+                    material,
+                    swapped: p.swapped,
+                };
+                if over.is_empty() {
+                    None
+                } else {
+                    Some((p.assignment_key.clone(), over))
+                }
             })
             .collect();
         match crate::project::save(&self.project, &self.project_path) {
@@ -665,7 +787,9 @@ impl App {
     }
 
     fn print_settings_input(&mut self, c: char) {
-        let Some(ps) = &mut self.print_settings else { return };
+        let Some(ps) = &mut self.print_settings else {
+            return;
+        };
         let (field, touched) = Self::print_settings_field(ps);
         if !*touched {
             field.clear();
@@ -677,14 +801,18 @@ impl App {
     }
 
     fn print_settings_backspace(&mut self) {
-        let Some(ps) = &mut self.print_settings else { return };
+        let Some(ps) = &mut self.print_settings else {
+            return;
+        };
         let (field, touched) = Self::print_settings_field(ps);
         *touched = true;
         field.pop();
     }
 
     fn print_settings_toggle_focus(&mut self) {
-        let Some(ps) = &mut self.print_settings else { return };
+        let Some(ps) = &mut self.print_settings else {
+            return;
+        };
         ps.focus = match ps.focus {
             PrintField::Kerf => PrintField::TrimAllowance,
             PrintField::TrimAllowance => PrintField::Kerf,
@@ -692,8 +820,13 @@ impl App {
     }
 
     fn confirm_print_settings(&mut self) {
-        let Some(ps) = self.print_settings.take() else { return };
-        match (ps.kerf_in.parse::<f64>(), ps.trim_allowance_in.parse::<f64>()) {
+        let Some(ps) = self.print_settings.take() else {
+            return;
+        };
+        match (
+            ps.kerf_in.parse::<f64>(),
+            ps.trim_allowance_in.parse::<f64>(),
+        ) {
             (Ok(kerf_in), Ok(trim_allowance_in)) => {
                 self.project.settings.kerf_in = kerf_in;
                 self.project.settings.trim_allowance_in = trim_allowance_in;
@@ -707,16 +840,35 @@ impl App {
     fn print(&mut self) {
         let parts: Vec<PackablePart> = self.parts.iter().map(Part::to_packable).collect();
         let trim_allowance_mm = self.project.settings.trim_allowance_in * MM_PER_IN;
-        let layout = pack(&parts, &self.stock, self.project.settings.kerf_in * MM_PER_IN, trim_allowance_mm);
+        let layout = pack(
+            &parts,
+            &self.stock,
+            self.project.settings.kerf_in * MM_PER_IN,
+            trim_allowance_mm,
+        );
         let unplaced = layout.unplaced.len();
         let out_path = self.project.out_pdf_path(&self.project_path);
-        let pdf_bytes = storystick_core::diagrams::render_pdf(&layout, trim_allowance_mm, crate::sections::classify, crate::sections::UNSECTIONED);
+        let pdf_bytes = storystick_core::diagrams::render_pdf(
+            &layout,
+            trim_allowance_mm,
+            crate::sections::classify,
+            crate::sections::UNSECTIONED,
+        );
         match std::fs::write(&out_path, pdf_bytes) {
             Ok(()) => {
                 let msg = if unplaced == 0 {
-                    format!("printed {} ({} sheets)", out_path.display(), layout.sheets.len())
+                    format!(
+                        "printed {} ({} sheets)",
+                        out_path.display(),
+                        layout.sheets.len()
+                    )
                 } else {
-                    format!("printed {} ({} sheets, {} part(s) unplaced)", out_path.display(), layout.sheets.len(), unplaced)
+                    format!(
+                        "printed {} ({} sheets, {} part(s) unplaced)",
+                        out_path.display(),
+                        layout.sheets.len(),
+                        unplaced
+                    )
                 };
                 self.set_status(msg);
             }
@@ -725,7 +877,11 @@ impl App {
     }
 }
 
-pub(crate) fn run(project: Project, project_path: PathBuf, global_stock: Vec<StockSheet>) -> Result<(), Box<dyn Error>> {
+pub(crate) fn run(
+    project: Project,
+    project_path: PathBuf,
+    global_stock: Vec<StockSheet>,
+) -> Result<(), Box<dyn Error>> {
     let global_materials = stock::distinct_materials(&global_stock);
     let materials = project.resolve_materials(&global_materials)?;
     project.validate_references(&materials)?;
@@ -779,7 +935,9 @@ pub(crate) fn run(project: Project, project_path: PathBuf, global_stock: Vec<Sto
                 app.expire_status();
                 continue;
             }
-            let Event::Key(key) = event::read()? else { continue };
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
             if key.kind != KeyEventKind::Press {
                 continue;
             }
@@ -921,7 +1079,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn material(name: &str, thickness_in: f64) -> Material {
-        Material { name: name.to_string(), thickness_mm: thickness_in * MM_PER_IN }
+        Material {
+            name: name.to_string(),
+            thickness_mm: thickness_in * MM_PER_IN,
+        }
     }
 
     fn part(thickness_in: f64, material: Option<&str>, unreliable: bool) -> Part {
@@ -936,7 +1097,10 @@ mod tests {
             thickness_in,
             unreliable,
             thickness_mismatch: false,
-            material: material.map(|name| Material { name: name.to_string(), thickness_mm: thickness_in * MM_PER_IN }),
+            material: material.map(|name| Material {
+                name: name.to_string(),
+                thickness_mm: thickness_in * MM_PER_IN,
+            }),
             is_exception: material.is_some(),
             swapped: false,
         }
@@ -951,9 +1115,15 @@ mod tests {
 
     #[test]
     fn unassigned_part_is_flagged_when_multiple_materials_share_its_thickness() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75), material("Sande Ply 3/4", 0.75)];
+        let materials = vec![
+            material("Baltic Birch 3/4", 0.75),
+            material("Sande Ply 3/4", 0.75),
+        ];
         let unassigned = part(0.75, None, false);
-        assert_eq!(part_flag(&unassigned, &materials), Some("ambiguous material"));
+        assert_eq!(
+            part_flag(&unassigned, &materials),
+            Some("ambiguous material")
+        );
     }
 
     #[test]
@@ -962,14 +1132,23 @@ mod tests {
         // and silently wrong the moment a second material at that
         // thickness joins the catalog. An unreviewed part must never look
         // the same as a resolved one.
-        let materials = vec![material("Baltic Birch 3/4", 0.75), material("Baltic Birch 1/4", 0.25)];
+        let materials = vec![
+            material("Baltic Birch 3/4", 0.75),
+            material("Baltic Birch 1/4", 0.25),
+        ];
         let unassigned = part(0.75, None, false);
-        assert_eq!(part_flag(&unassigned, &materials), Some("no material assigned"));
+        assert_eq!(
+            part_flag(&unassigned, &materials),
+            Some("no material assigned")
+        );
     }
 
     #[test]
     fn pinning_a_material_clears_the_ambiguous_flag() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75), material("Sande Ply 3/4", 0.75)];
+        let materials = vec![
+            material("Baltic Birch 3/4", 0.75),
+            material("Sande Ply 3/4", 0.75),
+        ];
         let pinned = part(0.75, Some("Sande Ply 3/4"), false);
         assert_eq!(part_flag(&pinned, &materials), None);
     }
@@ -979,12 +1158,16 @@ mod tests {
         let materials = vec![material("Baltic Birch 3/4", 0.75)];
         let mut mismatched = part(0.75, Some("Baltic Birch 3/4"), false);
         mismatched.thickness_mismatch = true;
-        assert_eq!(part_flag(&mismatched, &materials), Some("material thickness doesn't match this part's geometry"));
+        assert_eq!(
+            part_flag(&mismatched, &materials),
+            Some("material thickness doesn't match this part's geometry")
+        );
     }
 
     #[test]
     fn resolve_dims_leaves_the_raw_guess_alone_with_no_material() {
-        let (length_in, width_in, thickness_in, mismatch) = resolve_dims((30.0, 20.0, 0.75), None, false);
+        let (length_in, width_in, thickness_in, mismatch) =
+            resolve_dims((30.0, 20.0, 0.75), None, false);
         assert_eq!((length_in, width_in, thickness_in), (30.0, 20.0, 0.75));
         assert!(!mismatch);
     }
@@ -995,16 +1178,24 @@ mod tests {
         // the raw largest/middle/smallest guess mislabels the 0.25" width
         // as thickness. Knowing the assigned material is really 3/4"
         // fixes it.
-        let bb34 = Material { name: "Baltic Birch 3/4".to_string(), thickness_mm: 0.75 * MM_PER_IN };
-        let (length_in, width_in, thickness_in, mismatch) = resolve_dims((24.0, 0.75, 0.25), Some(&bb34), false);
+        let bb34 = Material {
+            name: "Baltic Birch 3/4".to_string(),
+            thickness_mm: 0.75 * MM_PER_IN,
+        };
+        let (length_in, width_in, thickness_in, mismatch) =
+            resolve_dims((24.0, 0.75, 0.25), Some(&bb34), false);
         assert_eq!((length_in, width_in, thickness_in), (24.0, 0.25, 0.75));
         assert!(!mismatch);
     }
 
     #[test]
     fn resolve_dims_flags_a_mismatch_instead_of_guessing() {
-        let unrelated = Material { name: "1/8\" hardboard".to_string(), thickness_mm: 0.125 * MM_PER_IN };
-        let (length_in, width_in, thickness_in, mismatch) = resolve_dims((30.0, 20.0, 0.75), Some(&unrelated), false);
+        let unrelated = Material {
+            name: "1/8\" hardboard".to_string(),
+            thickness_mm: 0.125 * MM_PER_IN,
+        };
+        let (length_in, width_in, thickness_in, mismatch) =
+            resolve_dims((30.0, 20.0, 0.75), Some(&unrelated), false);
         // No dimension is anywhere near 0.125" -- dims fall back to the
         // raw guess rather than silently picking the closest anyway.
         assert_eq!((length_in, width_in, thickness_in), (30.0, 20.0, 0.75));
@@ -1013,8 +1204,12 @@ mod tests {
 
     #[test]
     fn resolve_dims_applies_the_swap_after_any_material_correction() {
-        let bb34 = Material { name: "Baltic Birch 3/4".to_string(), thickness_mm: 0.75 * MM_PER_IN };
-        let (length_in, width_in, thickness_in, mismatch) = resolve_dims((24.0, 0.75, 0.25), Some(&bb34), true);
+        let bb34 = Material {
+            name: "Baltic Birch 3/4".to_string(),
+            thickness_mm: 0.75 * MM_PER_IN,
+        };
+        let (length_in, width_in, thickness_in, mismatch) =
+            resolve_dims((24.0, 0.75, 0.25), Some(&bb34), true);
         // Same correction as above (thickness -> 0.75, remaining sorted
         // 24/0.25), then length_in/width_in end up swapped on top.
         assert_eq!((length_in, width_in, thickness_in), (0.25, 24.0, 0.75));
@@ -1037,12 +1232,18 @@ mod tests {
         let path = "Bench / Left Carcass / Body 03 (2)";
         let a = assignment_key(path, 30.0, 16.25, 0.75);
         let b = assignment_key(path, 23.625, 17.25, 0.75);
-        assert_ne!(a, b, "two real parts sharing a path must never collapse onto one key");
+        assert_ne!(
+            a, b,
+            "two real parts sharing a path must never collapse onto one key"
+        );
     }
 
     #[test]
     fn compatible_materials_excludes_a_materially_different_thickness() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75), material("Baltic Birch 1/4", 0.25)];
+        let materials = vec![
+            material("Baltic Birch 3/4", 0.75),
+            material("Baltic Birch 1/4", 0.25),
+        ];
         let compat = compatible_materials(&materials, 0.75);
         assert_eq!(compat.len(), 1);
         assert_eq!(compat[0].name, "Baltic Birch 3/4");
@@ -1052,7 +1253,11 @@ mod tests {
     fn resolve_material_exception_always_wins_over_a_rule() {
         let mut autofill_map = BTreeMap::new();
         autofill_map.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
-        let (material, is_exception) = resolve_material("Bench / [Panel] Bottom", Some("Sande Ply 3/4".to_string()), &autofill_map);
+        let (material, is_exception) = resolve_material(
+            "Bench / [Panel] Bottom",
+            Some("Sande Ply 3/4".to_string()),
+            &autofill_map,
+        );
         assert_eq!(material.as_deref(), Some("Sande Ply 3/4"));
         assert!(is_exception);
     }
@@ -1061,7 +1266,8 @@ mod tests {
     fn resolve_material_falls_back_to_the_tag_rule_when_no_exception() {
         let mut autofill_map = BTreeMap::new();
         autofill_map.insert("[Panel]".to_string(), "Baltic Birch 3/4".to_string());
-        let (material, is_exception) = resolve_material("Bench / [Panel] Bottom", None, &autofill_map);
+        let (material, is_exception) =
+            resolve_material("Bench / [Panel] Bottom", None, &autofill_map);
         assert_eq!(material.as_deref(), Some("Baltic Birch 3/4"));
         assert!(!is_exception);
     }
@@ -1077,17 +1283,32 @@ mod tests {
     fn save_persists_an_exception_but_never_a_rule_derived_material() {
         let mut exception = part(0.75, Some("Baltic Birch 3/4"), false);
         exception.is_exception = true;
-        let saved = if exception.is_exception { exception.material.as_ref().map(|m| m.name.clone()) } else { None };
+        let saved = if exception.is_exception {
+            exception.material.as_ref().map(|m| m.name.clone())
+        } else {
+            None
+        };
         assert_eq!(saved, Some("Baltic Birch 3/4".to_string()));
 
         let mut rule_derived = part(0.75, Some("Baltic Birch 3/4"), false);
         rule_derived.is_exception = false;
-        let saved = if rule_derived.is_exception { rule_derived.material.as_ref().map(|m| m.name.clone()) } else { None };
-        assert_eq!(saved, None, "a rule-derived material is never frozen into an exception on save");
+        let saved = if rule_derived.is_exception {
+            rule_derived.material.as_ref().map(|m| m.name.clone())
+        } else {
+            None
+        };
+        assert_eq!(
+            saved, None,
+            "a rule-derived material is never frozen into an exception on save"
+        );
     }
 
     fn tagged_part(path: &str, material: Option<&str>) -> Part {
-        Part { path: path.to_string(), assignment_key: path.to_string(), ..part(0.75, material, false) }
+        Part {
+            path: path.to_string(),
+            assignment_key: path.to_string(),
+            ..part(0.75, material, false)
+        }
     }
 
     #[test]
@@ -1097,12 +1318,18 @@ mod tests {
             tagged_part("Bench / [Backer] Left", None),
             tagged_part("Bench / [Panel] Top", None),
         ];
-        assert_eq!(distinct_tags(&parts), vec![("[Panel]".to_string(), 2), ("[Backer]".to_string(), 1)]);
+        assert_eq!(
+            distinct_tags(&parts),
+            vec![("[Panel]".to_string(), 2), ("[Backer]".to_string(), 1)]
+        );
     }
 
     #[test]
     fn distinct_tags_counts_a_part_carrying_the_same_tag_twice_only_once() {
-        let parts = vec![tagged_part("Bench / [Panel] Section / [Panel] Bottom", None)];
+        let parts = vec![tagged_part(
+            "Bench / [Panel] Section / [Panel] Bottom",
+            None,
+        )];
         assert_eq!(distinct_tags(&parts), vec![("[Panel]".to_string(), 1)]);
     }
 
@@ -1123,13 +1350,22 @@ mod tests {
         let changed = apply_bulk_material(&mut parts, &autofill_map, &materials);
 
         assert_eq!(changed, vec![0]);
-        assert_eq!(parts[0].material.as_ref().map(|m| m.name.as_str()), Some("Baltic Birch 3/4"));
-        assert!(!parts[0].is_exception, "bulk-edit updates the rule, never stamps a per-part exception");
+        assert_eq!(
+            parts[0].material.as_ref().map(|m| m.name.as_str()),
+            Some("Baltic Birch 3/4")
+        );
+        assert!(
+            !parts[0].is_exception,
+            "bulk-edit updates the rule, never stamps a per-part exception"
+        );
     }
 
     #[test]
     fn apply_bulk_material_never_touches_a_part_with_its_own_exception() {
-        let materials = vec![material("Baltic Birch 3/4", 0.75), material("Sande Ply 3/4", 0.75)];
+        let materials = vec![
+            material("Baltic Birch 3/4", 0.75),
+            material("Sande Ply 3/4", 0.75),
+        ];
         let mut parts = vec![tagged_part("Bench / [Panel] A", Some("Sande Ply 3/4"))];
         parts[0].is_exception = true;
         let mut autofill_map = BTreeMap::new();
@@ -1138,7 +1374,11 @@ mod tests {
         let changed = apply_bulk_material(&mut parts, &autofill_map, &materials);
 
         assert!(changed.is_empty());
-        assert_eq!(parts[0].material.as_ref().map(|m| m.name.as_str()), Some("Sande Ply 3/4"), "an exception always outranks the rule, even after the rule changes");
+        assert_eq!(
+            parts[0].material.as_ref().map(|m| m.name.as_str()),
+            Some("Sande Ply 3/4"),
+            "an exception always outranks the rule, even after the rule changes"
+        );
     }
 
     #[test]

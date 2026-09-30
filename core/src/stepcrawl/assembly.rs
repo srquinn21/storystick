@@ -47,7 +47,8 @@ pub fn build_indices(entities: &HashMap<i64, String>) -> (Vec<BrepContainer>, As
             "PRODUCT" => {
                 products.insert(id, unquote(&args[0]));
             }
-            "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE" | "PRODUCT_DEFINITION_FORMATION" => {
+            "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE"
+            | "PRODUCT_DEFINITION_FORMATION" => {
                 formation_to_product.insert(id, refs(&args[2])[0]);
             }
             "PRODUCT_DEFINITION" => {
@@ -66,7 +67,11 @@ pub fn build_indices(entities: &HashMap<i64, String>) -> (Vec<BrepContainer>, As
                 if typ == "ADVANCED_BREP_SHAPE_REPRESENTATION" {
                     let name = unquote(&args[0]);
                     let solid_ids = refs(&args[1]);
-                    breps_by_container.push(BrepContainer { rep_id: id, container_name: name, solid_ids });
+                    breps_by_container.push(BrepContainer {
+                        rep_id: id,
+                        container_name: name,
+                        solid_ids,
+                    });
                 }
             }
             "NEXT_ASSEMBLY_USAGE_OCCURRENCE" => {
@@ -144,25 +149,42 @@ mod tests {
         entities.insert(1, "PRODUCT_DEFINITION('','',#3,#1)".to_string());
 
         // NAUO chain: root(#1) -> Bench(#11) -> Carcasses(#12) -> Carcass A(#13)
-        entities.insert(20, "NEXT_ASSEMBLY_USAGE_OCCURRENCE('N1','Bench','',#1,#11,$)".to_string());
-        entities.insert(21, "NEXT_ASSEMBLY_USAGE_OCCURRENCE('N2','Carcasses','',#11,#12,$)".to_string());
-        entities.insert(22, "NEXT_ASSEMBLY_USAGE_OCCURRENCE('N3','Carcass A','',#12,#13,$)".to_string());
+        entities.insert(
+            20,
+            "NEXT_ASSEMBLY_USAGE_OCCURRENCE('N1','Bench','',#1,#11,$)".to_string(),
+        );
+        entities.insert(
+            21,
+            "NEXT_ASSEMBLY_USAGE_OCCURRENCE('N2','Carcasses','',#11,#12,$)".to_string(),
+        );
+        entities.insert(
+            22,
+            "NEXT_ASSEMBLY_USAGE_OCCURRENCE('N3','Carcass A','',#12,#13,$)".to_string(),
+        );
 
         // Container linkage for Carcass A's brep representation
         entities.insert(14, "PRODUCT_DEFINITION_SHAPE('','',#13)".to_string());
         entities.insert(15, "SHAPE_DEFINITION_REPRESENTATION(#14,#16)".to_string());
         entities.insert(16, "SHAPE_REPRESENTATION('',(#17),#18)".to_string());
-        entities.insert(19, "ADVANCED_BREP_SHAPE_REPRESENTATION('CarcassA_Brep',(#100,#200),#18)".to_string());
+        entities.insert(
+            19,
+            "ADVANCED_BREP_SHAPE_REPRESENTATION('CarcassA_Brep',(#100,#200),#18)".to_string(),
+        );
 
         let (breps, index) = build_indices(&entities);
         assert_eq!(breps.len(), 1);
         let brep = &breps[0];
         assert_eq!(brep.solid_ids, vec![100, 200]);
 
-        let pd_id = index.container_pd(brep.rep_id).expect("container_pd should resolve");
+        let pd_id = index
+            .container_pd(brep.rep_id)
+            .expect("container_pd should resolve");
         assert_eq!(pd_id, 13);
 
         let path = index.ancestor_path(pd_id);
-        assert_eq!(path, vec!["Living Room Built-In", "Bench", "Carcasses", "Carcass A"]);
+        assert_eq!(
+            path,
+            vec!["Living Room Built-In", "Bench", "Carcasses", "Carcass A"]
+        );
     }
 }
