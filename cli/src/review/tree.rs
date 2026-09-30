@@ -269,16 +269,30 @@ fn collect_depth_first(order: &[String], children: &HashMap<String, Node>, out: 
 /// Column header for the leaf rows, aligned field-for-field with
 /// `leaf_line` -- this is a plain `Paragraph` drawn above the row list
 /// (see `ui::draw_assembly_list`), not part of the list widget itself.
+/// Which of a part's two in-plane dimensions the grain runs along, in the
+/// same terms the "Length"/"Width" columns already use -- see `Part::
+/// grain_along_length`.
+fn grain_label(part: &Part) -> &'static str {
+    if part.grain_along_length {
+        "Length"
+    } else {
+        "Width"
+    }
+}
+
 pub(super) fn header_line() -> Line<'static> {
     let header_style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
     let pad = " ".repeat(ROW_PREFIX_WIDTH);
     let left = format!("{pad}{:<NAME_FIELD_WIDTH$}", "Part");
     let measurements = format!(" {:>9}  {:>9}  {:>8} ", "Length", "Width", "Thick");
+    let grain = format!(" {:<6} ", "Grain");
     let material = " Material".to_string();
     Line::from(vec![
         Span::styled(left, header_style),
         divider(),
         Span::styled(measurements, header_style),
+        divider(),
+        Span::styled(grain, header_style),
         divider(),
         Span::styled(material, header_style),
     ])
@@ -297,6 +311,7 @@ pub(super) fn leaf_line(part: &Part, flagged: bool) -> Line<'static> {
         " {:>9.4}  {:>9.4}  {:>8.4} ",
         part.length_in, part.width_in, part.thickness_in
     );
+    let grain = format!(" {:<6} ", grain_label(part));
     let material = format!(" {material}");
     let style = if flagged {
         Style::new().fg(Color::Red)
@@ -307,6 +322,8 @@ pub(super) fn leaf_line(part: &Part, flagged: bool) -> Line<'static> {
         Span::styled(left, style),
         divider(),
         Span::styled(measurements, style),
+        divider(),
+        Span::styled(grain, style),
         divider(),
         Span::styled(material, style),
     ])
@@ -366,7 +383,7 @@ mod tests {
             thickness_mismatch: false,
             material: None,
             is_exception: false,
-            swapped: false,
+            grain_along_length: true,
         }
     }
 

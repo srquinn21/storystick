@@ -25,14 +25,21 @@
 //! does) -- there's no third "explicitly no material" state to hold in
 //! reserve, on either the exception or the rule side.
 //!
-//! Grain always runs with a part's length. stepcrawl's own length/width
-//! guess (longer of the two in-plane dimensions is length) is often
-//! exactly what you want, but not always -- the edit modal's Grain field
-//! swaps a part's length/width when it isn't, rather than exposing a
-//! separate "grain" concept: there was never an independent capability
-//! there to preserve (packing has only ever cared about which dimension
-//! is called length), so a second concept meaning the same thing was
-//! just something else to learn.
+//! A part's length/width labels are never user-editable: stepcrawl's own
+//! guess (longer of the two in-plane dimensions is length, corrected
+//! against a known material thickness by `resolve_dims`) is a plain
+//! geometric fact, not a decision to record. Grain direction *is* a
+//! decision -- which of those two dimensions the grain actually runs
+//! along -- and it's tracked as its own field (`Part::grain_along_length`,
+//! the edit modal's Grain field), independent of which one is labeled
+//! length. Defaulting to "along length" covers the common case, but a
+//! piece is sometimes designed with the grain running the other way on
+//! purpose, and that's not the same fact as which edge happens to be
+//! longer. `Part::to_packable` is the one place the two facts meet: it
+//! picks whichever raw dimension the grain runs along and hands *that*
+//! to `PackablePart` as `length_mm`, per that module's own "length_mm
+//! always runs with the grain" convention -- the packer never learns
+//! which edge this project calls "length" for display.
 //!
 //! Keys split into pure movement (bare keys: `hjkl`, `gg`/`G`, `/`, `]f`/
 //! `[f`, `n`/`N`) and commands, which live behind a leader key (bare
@@ -93,7 +100,7 @@ pub(crate) struct Part {
     pub path: String,
     /// This project's exception-map identity for this part: `path` plus
     /// this part's own *raw* dimensions (see `raw_length_in` etc, never
-    /// the possibly-corrected/swapped `length_in` etc -- a key that
+    /// the possibly material-corrected `length_in` etc -- a key that
     /// shifted under a material reassignment would orphan the very
     /// exception it's meant to persist). Shapr3D does not actually
     /// guarantee sibling body names are unique -- an un-renamed duplicate
@@ -113,11 +120,13 @@ pub(crate) struct Part {
     /// length, shorter is width, third is thickness) -- immutable for the
     /// part's lifetime, since it's the actual geometric measurement.
     /// `length_in`/`width_in`/`thickness_in` are derived from this (see
-    /// `resolve_dims`), recomputed whenever `material` or `swapped`
-    /// changes. Keeping the raw triple fixed is what makes that
-    /// derivation reversible: re-picking a different material, or
-    /// toggling the swap back off, recovers the exact original numbers
-    /// instead of drifting through repeated corrections.
+    /// `resolve_dims`), recomputed whenever `material` changes. Keeping
+    /// the raw triple fixed is what makes that derivation reversible:
+    /// re-picking a different material recovers the exact original
+    /// numbers instead of drifting through repeated corrections.
+    /// `grain_along_length` is unrelated to this derivation -- it never
+    /// changes which raw dimension is which, only which one packing
+    /// treats as running with the grain.
     pub raw_length_in: f64,
     pub raw_width_in: f64,
     pub raw_thickness_in: f64,
@@ -150,10 +159,12 @@ pub(crate) struct Part {
     /// what lets a newly tagged part in a future STEP revision pick up an
     /// existing rule automatically.
     pub is_exception: bool,
-    /// Grain always runs with length (see this module's docs); this says
-    /// whether length/width, as guessed, have been swapped so the part's
-    /// other edge runs with the grain instead.
-    pub swapped: bool,
+    /// Which of `length_in`/`width_in` the grain runs along -- `true`
+    /// (the default) for length, `false` when this piece is designed with
+    /// the grain running along its width instead. Independent of the
+    /// length/width labels themselves, which are never user-editable (see
+    /// this module's docs).
+    pub grain_along_length: bool,
 }
 
 fn assignment_key(path: &str, length_in: f64, width_in: f64, thickness_in: f64) -> String {
@@ -161,19 +172,15 @@ fn assignment_key(path: &str, length_in: f64, width_in: f64, thickness_in: f64) 
 }
 
 /// Derives (length_in, width_in, thickness_in, thickness_mismatch) from a
-/// part's raw (length_in, width_in, thickness_in) guess, a possibly-
-/// assigned material, and whether length/width have been manually
-/// swapped. Operates purely on the *values* in `raw`, never their
-/// current field positions, so it's safe to call repeatedly as material
-/// or swap state changes: re-deriving from the same three raw numbers
-/// each time means a cleared material or an untoggled swap recovers
-/// exactly the original guess, and a changed material re-picks thickness
-/// fresh rather than compounding onto a previous correction.
-fn resolve_dims(
-    raw: (f64, f64, f64),
-    material: Option<&Material>,
-    swapped: bool,
-) -> (f64, f64, f64, bool) {
+/// part's raw (length_in, width_in, thickness_in) guess and a possibly-
+/// assigned material. Operates purely on the *values* in `raw`, never
+/// their current field positions, so it's safe to call repeatedly as
+/// material state changes: re-deriving from the same three raw numbers
+/// each time means a cleared material recovers exactly the original
+/// guess, and a changed material re-picks thickness fresh rather than
+/// compounding onto a previous correction. Grain direction plays no part
+/// here -- see `Part::grain_along_length`.
+fn resolve_dims(raw: (f64, f64, f64), material: Option<&Material>) -> (f64, f64, f64, bool) {
     let (mut length_in, mut width_in, mut thickness_in) = raw;
     let mut thickness_mismatch = false;
     if let Some(m) = material {
@@ -190,9 +197,6 @@ fn resolve_dims(
             }
             Err(_) => thickness_mismatch = true,
         }
-    }
-    if swapped {
-        std::mem::swap(&mut length_in, &mut width_in);
     }
     (length_in, width_in, thickness_in, thickness_mismatch)
 }
@@ -221,11 +225,23 @@ fn print_settings_changed(current: (f64, f64), proposed: (f64, f64)) -> bool {
 }
 
 impl Part {
+    /// The one place `length_in`/`width_in` (this project's display
+    /// labels, always length >= width) and `grain_along_length` (a
+    /// separate, independent decision) meet: `PackablePart::length_mm`
+    /// means "the dimension that runs with the grain" (see `nesting`'s
+    /// own docs), so whichever of this part's two edges the grain
+    /// actually runs along is what gets handed to it as length_mm here,
+    /// regardless of which edge this project *displays* as "Length".
     fn to_packable(&self) -> PackablePart {
+        let (grain_in, cross_in) = if self.grain_along_length {
+            (self.length_in, self.width_in)
+        } else {
+            (self.width_in, self.length_in)
+        };
         let mut part = PackablePart::new(
             self.path.clone(),
-            self.length_in * MM_PER_IN,
-            self.width_in * MM_PER_IN,
+            grain_in * MM_PER_IN,
+            cross_in * MM_PER_IN,
             self.thickness_in * MM_PER_IN,
         );
         part.material_name = self.material.as_ref().map(|m| m.name.clone());
@@ -409,12 +425,11 @@ fn load_parts(
             let exception = over.and_then(|o| o.material.clone());
             let (material_name, is_exception) =
                 resolve_material(&instance.path, exception, &project.autofill);
-            let swapped = over.map(|o| o.swapped).unwrap_or(false);
+            let grain_along_length = over.map(|o| o.grain_along_length).unwrap_or(true);
             let material = material_name.map(|name| find_material(materials, &name).clone());
             let (length_in, width_in, thickness_in, thickness_mismatch) = resolve_dims(
                 (raw_length_in, raw_width_in, raw_thickness_in),
                 material.as_ref(),
-                swapped,
             );
             parts.push(Part {
                 path: instance.path.clone(),
@@ -429,7 +444,7 @@ fn load_parts(
                 thickness_mismatch,
                 material,
                 is_exception,
-                swapped,
+                grain_along_length,
             });
         }
     }
@@ -917,18 +932,17 @@ impl App {
     }
 
     /// Acts on the part-edit modal's focused field -- Material opens the
-    /// existing material picker (`open_picker`, unchanged: it already
-    /// resolves the target part from `selected_part_index`, which still
-    /// points at the right part while this modal has focus) and Grain
-    /// toggles the swap directly (`toggle_swap`, also unchanged). Only
-    /// the entry point moved; neither of these was rewritten.
+    /// existing material picker (`open_picker`, which already resolves
+    /// the target part from `selected_part_index`, still pointing at the
+    /// right part while this modal has focus) and Grain flips the grain
+    /// axis directly (`toggle_grain`).
     fn confirm_part_edit_field(&mut self) {
         let Some(pe) = &self.part_edit else {
             return;
         };
         match pe.focus {
             PartEditField::Material => self.open_picker(),
-            PartEditField::Grain => self.toggle_swap(),
+            PartEditField::Grain => self.toggle_grain(),
         }
     }
 
@@ -1009,8 +1023,10 @@ impl App {
     }
 
     /// Recomputes `length_in`/`width_in`/`thickness_in`/`thickness_mismatch`
-    /// for `self.parts[i]` from its raw dims, current material, and swap
-    /// state -- call after mutating either (see `resolve_dims`).
+    /// for `self.parts[i]` from its raw dims and current material -- call
+    /// after mutating the material (see `resolve_dims`). Grain direction
+    /// never needs this: `grain_along_length` doesn't participate in the
+    /// derivation.
     fn resolve_part_dims(&mut self, i: usize) {
         let material = self.parts[i].material.clone();
         let raw = (
@@ -1018,9 +1034,8 @@ impl App {
             self.parts[i].raw_width_in,
             self.parts[i].raw_thickness_in,
         );
-        let swapped = self.parts[i].swapped;
         let (length_in, width_in, thickness_in, thickness_mismatch) =
-            resolve_dims(raw, material.as_ref(), swapped);
+            resolve_dims(raw, material.as_ref());
         let part = &mut self.parts[i];
         part.length_in = length_in;
         part.width_in = width_in;
@@ -1091,15 +1106,26 @@ impl App {
         }
     }
 
-    fn toggle_swap(&mut self) {
+    /// Flips which of this part's two in-plane dimensions the grain runs
+    /// along -- a display-independent fact (see `Part::grain_along_length`),
+    /// so unlike a material change this never touches `length_in`/
+    /// `width_in` themselves.
+    fn toggle_grain(&mut self) {
         let Some(i) = self.selected_part_index() else {
             self.set_status("select a part first");
             return;
         };
-        self.parts[i].swapped = !self.parts[i].swapped;
-        self.resolve_part_dims(i);
+        self.parts[i].grain_along_length = !self.parts[i].grain_along_length;
         self.dirty = true;
-        self.set_status(format!("swapped length/width for {}", self.parts[i].path));
+        let axis = if self.parts[i].grain_along_length {
+            "length"
+        } else {
+            "width"
+        };
+        self.set_status(format!(
+            "grain now runs along {axis} for {}",
+            self.parts[i].path
+        ));
     }
 
     fn save(&mut self) {
@@ -1117,7 +1143,7 @@ impl App {
                 };
                 let over = PartOverride {
                     material,
-                    swapped: p.swapped,
+                    grain_along_length: p.grain_along_length,
                 };
                 if over.is_empty() {
                     None
@@ -1708,7 +1734,7 @@ mod tests {
                 thickness_mm: thickness_in * MM_PER_IN,
             }),
             is_exception: material.is_some(),
-            swapped: false,
+            grain_along_length: true,
         }
     }
 
@@ -1788,8 +1814,7 @@ mod tests {
 
     #[test]
     fn resolve_dims_leaves_the_raw_guess_alone_with_no_material() {
-        let (length_in, width_in, thickness_in, mismatch) =
-            resolve_dims((30.0, 20.0, 0.75), None, false);
+        let (length_in, width_in, thickness_in, mismatch) = resolve_dims((30.0, 20.0, 0.75), None);
         assert_eq!((length_in, width_in, thickness_in), (30.0, 20.0, 0.75));
         assert!(!mismatch);
     }
@@ -1805,7 +1830,7 @@ mod tests {
             thickness_mm: 0.75 * MM_PER_IN,
         };
         let (length_in, width_in, thickness_in, mismatch) =
-            resolve_dims((24.0, 0.75, 0.25), Some(&bb34), false);
+            resolve_dims((24.0, 0.75, 0.25), Some(&bb34));
         assert_eq!((length_in, width_in, thickness_in), (24.0, 0.25, 0.75));
         assert!(!mismatch);
     }
@@ -1817,7 +1842,7 @@ mod tests {
             thickness_mm: 0.125 * MM_PER_IN,
         };
         let (length_in, width_in, thickness_in, mismatch) =
-            resolve_dims((30.0, 20.0, 0.75), Some(&unrelated), false);
+            resolve_dims((30.0, 20.0, 0.75), Some(&unrelated));
         // No dimension is anywhere near 0.125" -- dims fall back to the
         // raw guess rather than silently picking the closest anyway.
         assert_eq!((length_in, width_in, thickness_in), (30.0, 20.0, 0.75));
@@ -1825,17 +1850,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dims_applies_the_swap_after_any_material_correction() {
-        let bb34 = Material {
-            name: "Baltic Birch 3/4".to_string(),
-            thickness_mm: 0.75 * MM_PER_IN,
-        };
-        let (length_in, width_in, thickness_in, mismatch) =
-            resolve_dims((24.0, 0.75, 0.25), Some(&bb34), true);
-        // Same correction as above (thickness -> 0.75, remaining sorted
-        // 24/0.25), then length_in/width_in end up swapped on top.
-        assert_eq!((length_in, width_in, thickness_in), (0.25, 24.0, 0.75));
-        assert!(!mismatch);
+    fn to_packable_swaps_length_and_width_when_grain_runs_along_width() {
+        // A part labeled "Length: 24, Width: 12" but designed with the
+        // grain running along its 12" edge instead: to_packable must hand
+        // the packer 12 as length_mm (the grain-aligned edge), not 24 --
+        // length_in/width_in themselves stay exactly as measured/labeled.
+        let mut p = part(0.75, Some("Baltic Birch 3/4"), false);
+        p.length_in = 24.0;
+        p.width_in = 12.0;
+        p.grain_along_length = false;
+        let packed = p.to_packable();
+        assert_eq!((p.length_in, p.width_in), (24.0, 12.0));
+        assert_eq!(packed.length_mm, 12.0 * MM_PER_IN);
+        assert_eq!(packed.width_mm, 24.0 * MM_PER_IN);
     }
 
     #[test]

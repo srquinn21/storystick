@@ -413,7 +413,7 @@ assignments:
             "Bench / Body".to_string(),
             PartOverride {
                 material: Some("Sande Ply 3/4".to_string()),
-                swapped: false,
+                grain_along_length: true,
             },
         );
         let project = Project {
@@ -465,7 +465,7 @@ assignments:
             "Bench / Body".to_string(),
             PartOverride {
                 material: Some("Oak".to_string()),
-                swapped: false,
+                grain_along_length: true,
             },
         );
         let project = Project {

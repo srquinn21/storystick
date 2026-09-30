@@ -427,10 +427,10 @@ fn draw_part_edit(frame: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .map(|m| m.name.as_str())
         .unwrap_or("-");
-    let grain = if part.swapped {
-        "swapped"
+    let grain = if part.grain_along_length {
+        "along length"
     } else {
-        "as measured"
+        "along width"
     };
 
     let lines = vec![
