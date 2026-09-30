@@ -210,6 +210,16 @@ fn format_editable(v: f64) -> String {
     }
 }
 
+/// Whether a confirmed (kerf, trim_allowance) pair actually differs from
+/// the project's current settings -- confirming the pre-filled values
+/// just to print (by far the common case: open print settings, hit
+/// Enter) must never register as a change here, only an edited value
+/// should. `App::confirm_print_settings` uses this to decide whether
+/// printing marks the project modified.
+fn print_settings_changed(current: (f64, f64), proposed: (f64, f64)) -> bool {
+    (proposed.0 - current.0).abs() > 1e-9 || (proposed.1 - current.1).abs() > 1e-9
+}
+
 impl Part {
     fn to_packable(&self) -> PackablePart {
         let mut part = PackablePart::new(
@@ -1185,9 +1195,18 @@ impl App {
             ps.trim_allowance_in.parse::<f64>(),
         ) {
             (Ok(kerf_in), Ok(trim_allowance_in)) => {
+                let changed = print_settings_changed(
+                    (
+                        self.project.settings.kerf_in,
+                        self.project.settings.trim_allowance_in,
+                    ),
+                    (kerf_in, trim_allowance_in),
+                );
                 self.project.settings.kerf_in = kerf_in;
                 self.project.settings.trim_allowance_in = trim_allowance_in;
-                self.dirty = true;
+                if changed {
+                    self.dirty = true;
+                }
                 self.print();
             }
             _ => self.set_status("kerf and trim allowance must both be numbers, in inches"),
@@ -1827,6 +1846,19 @@ mod tests {
         assert_eq!(format_editable(0.125), "0.125");
         assert_eq!(format_editable(0.0), "0");
         assert_eq!(format_editable(1.0), "1");
+    }
+
+    #[test]
+    fn print_settings_changed_is_false_when_confirming_the_prefilled_values() {
+        // The common case: open print settings, hit Enter without
+        // editing either field. Printing must not register as a change.
+        assert!(!print_settings_changed((0.125, 0.0), (0.125, 0.0)));
+    }
+
+    #[test]
+    fn print_settings_changed_is_true_when_either_value_is_actually_edited() {
+        assert!(print_settings_changed((0.125, 0.0), (0.25, 0.0)));
+        assert!(print_settings_changed((0.125, 0.0), (0.125, 0.0625)));
     }
 
     #[test]
